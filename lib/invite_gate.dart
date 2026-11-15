@@ -71,7 +71,6 @@ class _InviteGateAppState extends State<InviteGateApp>
   DirectChatApi? _chatApi;
   bool _busy = false;
   bool _checking = false;
-  bool _restoring = false;
   String? _blockedMessage;
 
   @override
@@ -85,16 +84,6 @@ class _InviteGateAppState extends State<InviteGateApp>
     unawaited(widget.cache.putText('direct-client-identity-number', ''));
     unawaited(_loadDeviceName());
     WidgetsBinding.instance.addObserver(this);
-    final savedCode = widget.cache.text('direct-invite-code');
-    final savedClientId = widget.cache.text('direct-client-id');
-    if (savedCode != null &&
-        savedCode.isNotEmpty &&
-        savedClientId != null &&
-        savedClientId.isNotEmpty) {
-      _inviteCode.text = savedCode;
-      _restoring = true;
-      unawaited(_restoreSession(savedCode, savedClientId));
-    }
   }
 
   @override
@@ -127,89 +116,6 @@ class _InviteGateAppState extends State<InviteGateApp>
     setClientAppForeground(state == AppLifecycleState.resumed);
     if (state == AppLifecycleState.resumed && _clientId != null) {
       unawaited(_revalidate());
-    }
-  }
-
-  Future<void> _restoreSession(
-    String code,
-    String clientId,
-  ) async {
-    AppLogger.log('client.session_restore_started');
-    try {
-      final deviceIdentity = await persistentDeviceIdentity(widget.cache);
-      if (!mounted) return;
-      await ensureServerCertificatePinned(
-        context,
-        widget.serverUri,
-        widget.cache,
-        confirmOnFirstUse: false,
-      );
-      final deviceName = await _readDeviceName();
-      final clientName = widget.cache.text('direct-client-name') ?? deviceName;
-      final api = _createApi(code);
-      late final Map<String, dynamic> response;
-      try {
-        response = await api.validate(
-          code: code,
-          clientId: clientId,
-          clientName: clientName,
-          deviceName: deviceName,
-          deviceIdentity: deviceIdentity,
-          token: widget.cache.text('direct-token:$clientId') ?? '',
-        );
-      } finally {
-        api.close();
-      }
-      if (response['valid'] != true) {
-        await _lock(
-          _invalidInviteMessage(response['error']),
-          permanent: true,
-        );
-        return;
-      }
-      final token = response['token'];
-      if (token is! String || token.isEmpty) {
-        throw const FormatException('Server did not return a client token.');
-      }
-      final resolvedClientId = response['client_id'] as String? ?? clientId;
-      await widget.cache.putText('direct-client-id', resolvedClientId);
-      await widget.cache.putText('direct-token:$resolvedClientId', token);
-      await _startBackgroundService(code, resolvedClientId, token);
-      if (!mounted) return;
-      setState(() {
-        _code = code;
-        _clientId = resolvedClientId;
-        _connectedClientName = clientName;
-        _connectedDeviceName = deviceName;
-        _error = null;
-      });
-      AppLogger.log('client.session_restored');
-      _timer?.cancel();
-      _timer = Timer.periodic(
-        const Duration(seconds: 10),
-        (_) => unawaited(_revalidate()),
-      );
-    } on DirectChatValidationRejectedException catch (error) {
-      await _lock(
-        '服务器拒绝了邀请码验证（HTTP ${error.statusCode}），设备已被拉黑，应用已锁定。',
-        permanent: true,
-      );
-    } catch (error) {
-      AppLogger.log(
-        'client.session_restore_failed',
-        level: 'error',
-        error: error,
-      );
-      AppLogger.log(
-        'client.server_connection_failed',
-        level: 'error',
-        error: error,
-      );
-      if (mounted) {
-        setState(() => _error = serverConnectionErrorMessage(error));
-      }
-    } finally {
-      if (mounted) setState(() => _restoring = false);
     }
   }
 
@@ -265,7 +171,6 @@ class _InviteGateAppState extends State<InviteGateApp>
       final resolvedClientId = response['client_id'] as String? ?? clientId;
       await widget.cache.putText('direct-client-id', resolvedClientId);
       await widget.cache.putText('direct-token:$resolvedClientId', token);
-      await widget.cache.putText('direct-invite-code', code);
       await _startBackgroundService(code, resolvedClientId, token);
       _inviteCode.clear();
       if (!mounted) return;
@@ -515,12 +420,6 @@ class _InviteGateAppState extends State<InviteGateApp>
         deviceName: _connectedDeviceName ?? '我的手机',
         inviteCode: _code!,
         cache: widget.cache,
-      );
-    }
-    if (_restoring) {
-      return const MaterialApp(
-        title: 'Consent Chat',
-        home: Scaffold(body: Center(child: CircularProgressIndicator())),
       );
     }
     return MaterialApp(

@@ -19,8 +19,30 @@ import 'direct_chat.dart';
 import 'message_crypto.dart';
 import 'server_tls.dart';
 import 'secure_cache.dart';
+import 'video_call.dart';
 
 const _uuid = Uuid();
+
+class _DirectHostUploadCancelled implements Exception {
+  const _DirectHostUploadCancelled();
+}
+
+class _DirectVideoCall {
+  _DirectVideoCall({
+    required this.id,
+    required this.clientId,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String clientId;
+  final DateTime createdAt;
+  final List<Map<String, dynamic>> clientEvents = [];
+  final List<Map<String, dynamic>> adminEvents = [];
+  DateTime lastActivity = DateTime.now().toUtc();
+  bool accepted = false;
+  bool ended = false;
+}
 
 String _encryptMediaChunk(Map<String, Object?> arguments) =>
     DailyInviteCipher(arguments['code'] as String)
@@ -52,6 +74,7 @@ class InviteHostController extends ChangeNotifier {
   static const _messagesKey = 'direct-host-messages';
   static const _mediaKey = 'direct-host-media';
   static const _localMediaPathsKey = 'direct-host-local-media-paths';
+  static const _videoCallIceServersKey = 'direct-host-video-call-ice-servers';
   final InviteHostStore _cache;
   final Directory? _providedMediaDirectory;
   Directory? _mediaRoot;
@@ -66,6 +89,8 @@ class InviteHostController extends ChangeNotifier {
   final Map<String, Map<String, dynamic>> _media = {};
   final Map<String, String> _localMediaPaths = {};
   final Map<String, Map<String, dynamic>> _uploads = {};
+  final Map<String, _DirectVideoCall> _videoCalls = {};
+  final Set<String> _cancelledAdminUploads = {};
   final Map<String, List<DateTime>> _failedAttempts = {};
   String? _inviteCode;
   String? _certificateFingerprint;
@@ -78,13 +103,237 @@ class InviteHostController extends ChangeNotifier {
   String? get adminCodeForDisplay => _inviteCode;
   String? get error => _error;
   String? get certificateFingerprint => _certificateFingerprint;
-  List<InviteClientRequest> get clients => _clients.values.toList()
+  List<Map<String, dynamic>> get videoCallIceServers =>
+      _loadVideoCallIceServers();
+  List<InviteClientRequest> get clients =>
+      _clients.values.toList()
     ..sort((left, right) => right.lastSeen.compareTo(left.lastSeen));
   Set<String> get allowedIps => Set.unmodifiable(_allowedIps);
   String? avatarForClient(String clientId) =>
       _registeredClients[clientId]?['avatar_data'] as String?;
   String? serverAvatarForClient(String clientId) =>
       _registeredClients[clientId]?['server_avatar_data'] as String?;
+
+  List<Map<String, dynamic>> _loadVideoCallIceServers() {
+    final stored = _cache.value(_videoCallIceServersKey);
+    if (stored == null) {
+      return const [
+        {
+          'urls': ['stun:stun.l.google.com:19302'],
+        },
+      ];
+    }
+    if (stored is! String) {
+      throw const FormatException(
+        'Stored video call ICE settings are invalid.',
+      );
+    }
+    final decoded = jsonDecode(stored);
+    if (decoded is! List || decoded.any((entry) => entry is! Map)) {
+      throw const FormatException(
+        'Stored video call ICE settings are invalid.',
+      );
+    }
+    return decoded
+        .map((entry) => Map<String, dynamic>.from(entry as Map))
+        .toList();
+  }
+
+  Future<void> saveVideoCallIceServers({
+    required String stunUrl,
+    required String turnUrl,
+    required String turnUsername,
+    required String turnPassword,
+  }) async {
+    final normalizedStun = stunUrl.trim();
+    final normalizedTurn = turnUrl.trim();
+    final username = turnUsername.trim();
+    final password = turnPassword;
+    if (!RegExp(r'^stuns?:[^\s]{1,250}$').hasMatch(normalizedStun)) {
+      throw ArgumentError('STUN 地址必须以 stun: 或 stuns: 开头。');
+    }
+    final iceServers = <Map<String, dynamic>>[
+      {
+        'urls': [normalizedStun],
+      },
+    ];
+    if (normalizedTurn.isNotEmpty) {
+      if (!RegExp(r'^turns?:[^\s]{1,250}$').hasMatch(normalizedTurn) ||
+          username.isEmpty ||
+          password.isEmpty ||
+          username.length > 256 ||
+          password.length > 256) {
+        throw ArgumentError('TURN 地址、用户名和密码必须完整填写。');
+      }
+      iceServers.add({
+        'urls': [normalizedTurn],
+        'username': username,
+        'credential': password,
+      });
+    } else if (username.isNotEmpty || password.isNotEmpty) {
+      throw ArgumentError('填写 TURN 凭据前请先填写 TURN 地址。');
+    }
+    await _cache.putValue(_videoCallIceServersKey, jsonEncode(iceServers));
+  }
+
+  Future<void> _importVideoCallIceServers() async {
+    if (!Platform.isWindows) return;
+    final configFile = File(r'C:\ProgramData\ConsentChatTurn\turn-ice.json');
+    if (!await configFile.exists()) return;
+
+    final decoded = jsonDecode(await configFile.readAsString());
+    if (decoded is! Map ||
+        decoded['stunUrl'] is! String ||
+        decoded['turnUrl'] is! String ||
+        decoded['turnUsername'] is! String ||
+        decoded['turnPassword'] is! String) {
+      throw const FormatException(
+        'The local TURN configuration file is invalid.',
+      );
+    }
+    await saveVideoCallIceServers(
+      stunUrl: decoded['stunUrl'] as String,
+      turnUrl: decoded['turnUrl'] as String,
+      turnUsername: decoded['turnUsername'] as String,
+      turnPassword: decoded['turnPassword'] as String,
+    );
+    await configFile.delete();
+  }
+
+  Future<String> startVideoCall(String clientId) async {
+    final client = _registeredClients[clientId];
+    if (client == null || client['revoked'] == true) {
+      throw StateError('客户端不存在或授权已撤销。');
+    }
+    final previous = _videoCalls[clientId];
+    if (previous != null && !previous.ended) {
+      final idle = DateTime.now().toUtc().difference(previous.lastActivity);
+      if (!previous.accepted && idle > const Duration(minutes: 1) ||
+          previous.accepted && idle > const Duration(hours: 3)) {
+        previous.ended = true;
+      } else {
+        throw StateError('该客户端已有进行中或等待接听的视频通话。');
+      }
+    }
+    final call = _DirectVideoCall(
+      id: _uuid.v4(),
+      clientId: clientId,
+      createdAt: DateTime.now().toUtc(),
+    );
+    _videoCalls[clientId] = call;
+    _queueVideoCallEvent(call.clientEvents, {
+      'call_id': call.id,
+      'type': 'incoming',
+      'created_at': call.createdAt.toIso8601String(),
+      'ice_servers': videoCallIceServers,
+    });
+    return call.id;
+  }
+
+  List<Map<String, dynamic>> takeClientVideoCallEvents(String clientId) =>
+      _takeVideoCallEvents(_videoCalls[clientId]?.clientEvents);
+
+  List<Map<String, dynamic>> takeAdminVideoCallEvents(String clientId) =>
+      _takeVideoCallEvents(_videoCalls[clientId]?.adminEvents);
+
+  void sendAdminVideoCallSignal({
+    required String clientId,
+    required String callId,
+    required String type,
+    String? sdp,
+    Map<String, dynamic>? candidate,
+  }) {
+    _addVideoCallSignal(
+      clientId: clientId,
+      callId: callId,
+      type: type,
+      signal: {
+        if (sdp != null) 'sdp': sdp,
+        if (candidate != null) 'candidate': candidate,
+      },
+      fromClient: false,
+    );
+  }
+
+  void _queueVideoCallEvent(
+    List<Map<String, dynamic>> queue,
+    Map<String, dynamic> event,
+  ) {
+    if (queue.length >= 100) {
+      throw StateError('Too many pending video call signaling events.');
+    }
+    queue.add(event);
+  }
+
+  List<Map<String, dynamic>> _takeVideoCallEvents(
+    List<Map<String, dynamic>>? queue,
+  ) {
+    if (queue == null || queue.isEmpty) return const [];
+    final events = queue
+        .map((event) => Map<String, dynamic>.from(event))
+        .toList();
+    queue.clear();
+    return events;
+  }
+
+  void _addVideoCallSignal({
+    required String clientId,
+    required String callId,
+    required String type,
+    required Map<String, dynamic> signal,
+    required bool fromClient,
+  }) {
+    const clientSignalTypes = {
+      'accept',
+      'reject',
+      'answer',
+      'candidate',
+      'hangup',
+    };
+    const adminSignalTypes = {'offer', 'candidate', 'hangup'};
+    if (!(fromClient ? clientSignalTypes : adminSignalTypes).contains(type)) {
+      throw ArgumentError('Unsupported video call signal type.');
+    }
+    final call = _videoCalls[clientId];
+    if (call == null || call.id != callId || call.ended) {
+      throw StateError('The video call is no longer active.');
+    }
+    final event = <String, dynamic>{
+      'call_id': callId,
+      'type': type,
+      'created_at': DateTime.now().toUtc().toIso8601String(),
+      ...signal,
+    };
+    if (type == 'candidate') {
+      final candidate = event['candidate'];
+      if (candidate is! Map ||
+          candidate['candidate'] is! String ||
+          (candidate['candidate'] as String).length > 4096 ||
+          (candidate['sdp_mid'] != null && candidate['sdp_mid'] is! String) ||
+          (candidate['sdp_mline_index'] != null &&
+              candidate['sdp_mline_index'] is! int)) {
+        throw ArgumentError('Invalid ICE candidate.');
+      }
+    } else if (type == 'offer' || type == 'answer') {
+      if (event['sdp'] is! String ||
+          (event['sdp'] as String).length > 48 * 1024) {
+        throw ArgumentError('Invalid video call session description.');
+      }
+    }
+    if (type == 'accept') {
+      call.accepted = true;
+    } else if (type == 'reject' || type == 'hangup') {
+      call.ended = true;
+    } else if (!call.accepted) {
+      throw StateError('The client has not accepted this video call.');
+    }
+    call.lastActivity = DateTime.now().toUtc();
+    _queueVideoCallEvent(
+      fromClient ? call.adminEvents : call.clientEvents,
+      event,
+    );
+  }
+
   String? deviceIdentityForClient(String clientId) =>
       _registeredClients[clientId]?['device_identity'] as String?;
   List<Map<String, dynamic>> get registeredClients =>
@@ -93,8 +342,7 @@ class InviteHostController extends ChangeNotifier {
           ..remove('device_identity')
           ..remove('token');
         return details;
-      }).toList()
-        ..sort(
+      }).toList()..sort(
           (left, right) => (right['last_seen'] as String).compareTo(
             left['last_seen'] as String,
           ),
@@ -140,10 +388,10 @@ class InviteHostController extends ChangeNotifier {
         },
       );
     }
-    return entries.values.toList()
-      ..sort((left, right) => (left['code'] as String).compareTo(
-            right['code'] as String,
-          ));
+    return entries.values.toList()..sort(
+      (left, right) =>
+          (left['code'] as String).compareTo(right['code'] as String),
+    );
   }
 
   List<Map<String, dynamic>> messagesFor(
@@ -204,15 +452,24 @@ class InviteHostController extends ChangeNotifier {
     bool persist = true,
   }) async {
     final message = _messages
-        .where((item) =>
+        .where(
+          (item) =>
             item['client_id'] == clientId &&
             item['id'].toString() == messageId &&
-            item['pending'] == true)
+              item['pending'] == true,
+        )
         .firstOrNull;
     if (message == null) return;
     message.addAll(updates);
     if (persist) await _cache.putMapList(_messagesKey, _messages);
     _notify();
+  }
+
+  bool isAdminUploadCancelled(String clientId, String messageId) =>
+      _cancelledAdminUploads.contains('$clientId:$messageId');
+
+  void clearAdminUploadCancellation(String clientId, String messageId) {
+    _cancelledAdminUploads.remove('$clientId:$messageId');
   }
 
   Future<void> deleteMessages(
@@ -226,6 +483,7 @@ class InviteHostController extends ChangeNotifier {
     if (ids.isEmpty || ids.length > 500 || ids.any((id) => id.isEmpty)) {
       throw ArgumentError('Select between 1 and 500 messages to delete.');
     }
+    _cancelledAdminUploads.addAll(ids.map((id) => '$clientId:$id'));
     final abandonedUploads = _uploads.entries
         .where(
           (entry) =>
@@ -251,6 +509,24 @@ class InviteHostController extends ChangeNotifier {
           message['client_id'] == clientId &&
           ids.contains(message['id']?.toString()),
     );
+    final pendingFilePaths = removed
+        .where((item) => item['pending'] == true)
+        .map((item) => item['file_path'])
+        .whereType<String>()
+        .toList();
+    if (pendingFilePaths.isNotEmpty) {
+      final pendingDirectory = await directCacheDirectory(
+        'pending-attachments',
+        segments: [clientId],
+      );
+      final pendingRoot = '${pendingDirectory.path}${Platform.pathSeparator}';
+      for (final filePath in pendingFilePaths) {
+        final normalizedPath = File(filePath).absolute.path.toLowerCase();
+        if (!normalizedPath.startsWith(pendingRoot.toLowerCase())) continue;
+        final file = File(filePath);
+        if (await file.exists()) await file.delete();
+      }
+    }
     _localMediaPaths.removeWhere(
       (key, _) =>
           key.startsWith('$clientId:') &&
@@ -335,18 +611,18 @@ class InviteHostController extends ChangeNotifier {
         );
         final bytes = media['encrypted'] == false
             ? await chunkFile.readAsBytes()
-            : base64Decode(await compute(_decryptMediaChunk, {
+            : base64Decode(
+                await compute(_decryptMediaChunk, {
                 'code': client['invite_code'] as String,
                 'ciphertext': await chunkFile.readAsString(),
-              }));
+                }),
+              );
         if (isCancelled?.call() == true) {
           throw const DirectDownloadCancelled();
         }
         output.add(bytes);
         await output.flush();
-        onProgress?.call(
-          ((index + 1) * 100 ~/ chunkCount).clamp(0, 100),
-        );
+        onProgress?.call(((index + 1) * 100 ~/ chunkCount).clamp(0, 100));
       }
       if (isCancelled?.call() == true) {
         throw const DirectDownloadCancelled();
@@ -417,10 +693,12 @@ class InviteHostController extends ChangeNotifier {
     IOSink? output;
     try {
       final previewRoot = await directCacheDirectory('preview-temp');
-      temporaryDirectory =
-          await previewRoot.createTemp('consent-chat-preview-');
-      final extension =
-          _pendingAttachmentExtension(upload['file_name'] as String);
+      temporaryDirectory = await previewRoot.createTemp(
+        'consent-chat-preview-',
+      );
+      final extension = _pendingAttachmentExtension(
+        upload['file_name'] as String,
+      );
       final videoFile = File(
         '${temporaryDirectory.path}${Platform.pathSeparator}video$extension',
       );
@@ -432,10 +710,12 @@ class InviteHostController extends ChangeNotifier {
         );
         final bytes = upload['encrypted'] == false
             ? await chunkFile.readAsBytes()
-            : base64Decode(await compute(_decryptMediaChunk, {
+            : base64Decode(
+                await compute(_decryptMediaChunk, {
                 'code': client['invite_code'] as String,
                 'ciphertext': await chunkFile.readAsString(),
-              }));
+                }),
+              );
         output.add(bytes);
       }
       await output.flush();
@@ -500,9 +780,10 @@ class InviteHostController extends ChangeNotifier {
       ..usePrivateKeyBytes(privateKey);
     _certificateFingerprint = certificateFingerprint;
     final server = await HttpServer.bindSecure(
-      bindAddress ?? InternetAddress.anyIPv4,
+      bindAddress ?? InternetAddress.anyIPv6,
       port,
       securityContext,
+      v6Only: false,
       shared: true,
     );
     if (Platform.isAndroid) {
@@ -523,11 +804,7 @@ class InviteHostController extends ChangeNotifier {
       },
       onError: (Object error) {
         _error = 'Server socket error: $error';
-        AppLogger.log(
-          'server.socket_error',
-          level: 'error',
-          error: error,
-        );
+        AppLogger.log('server.socket_error', level: 'error', error: error);
         _notify();
       },
     );
@@ -628,10 +905,7 @@ class InviteHostController extends ChangeNotifier {
       _inviteCodeCreatedAt[code] = createdAt;
     }
     await _saveInviteCodes();
-    AppLogger.log(
-      'invite_codes.added',
-      details: {'count': uniqueCodes.length},
-    );
+    AppLogger.log('invite_codes.added', details: {'count': uniqueCodes.length});
     _notify();
   }
 
@@ -661,7 +935,8 @@ class InviteHostController extends ChangeNotifier {
     if (client == null) throw StateError('Unknown client.');
     if (_constantTimeEquals(normalizedCode, _inviteCode ?? '')) {
       throw ArgumentError(
-          'The client invite code cannot be the admin password.');
+        'The client invite code cannot be the admin password.',
+      );
     }
     if (_invalidInviteCodes.contains(normalizedCode)) {
       throw ArgumentError('该邀请码已失效，请输入新的邀请码。');
@@ -713,10 +988,7 @@ class InviteHostController extends ChangeNotifier {
     if (client == null ||
         !_setAvatarFields(
           client,
-          {
-            'server_avatar_data': data,
-            'server_avatar_mime_type': mimeType,
-          },
+          {'server_avatar_data': data, 'server_avatar_mime_type': mimeType},
           'server_avatar_data',
           'server_avatar_mime_type',
         )) {
@@ -803,11 +1075,14 @@ class InviteHostController extends ChangeNotifier {
       data: data,
       body: body,
     );
-    AppLogger.log('message.sent', details: {
+    AppLogger.log(
+      'message.sent',
+      details: {
       'type': 'attachment',
       'mime_type': mimeType,
       'bytes': base64Decode(data).length,
-    });
+      },
+    );
     _notify();
   }
 
@@ -821,6 +1096,7 @@ class InviteHostController extends ChangeNotifier {
     String body = '',
     String? previewData,
     ValueChanged<int>? onProgress,
+    bool Function()? isCancelled,
   }) async {
     final client = _registeredClients[clientId];
     if (client == null) throw StateError('Unknown client.');
@@ -859,11 +1135,14 @@ class InviteHostController extends ChangeNotifier {
     var chunkCount = 0;
     try {
       while (offset < fileSize) {
+        if (isCancelled?.call() == true ||
+            _cancelledAdminUploads.contains('$clientId:$messageId')) {
+          throw const _DirectHostUploadCancelled();
+        }
         final end = (offset + chunkSize).clamp(0, fileSize);
-        final bytes = await file.openRead(offset, end).fold<List<int>>(
-          <int>[],
-          (all, next) => all..addAll(next),
-        );
+        final bytes = await file
+            .openRead(offset, end)
+            .fold<List<int>>(<int>[], (all, next) => all..addAll(next));
         final chunkFile = File(
           '${staging.path}${Platform.pathSeparator}$chunkCount.chunk',
         );
@@ -880,6 +1159,10 @@ class InviteHostController extends ChangeNotifier {
         chunkCount++;
         onProgress?.call((offset * 98 ~/ fileSize).clamp(0, 98));
       }
+      if (isCancelled?.call() == true ||
+          _cancelledAdminUploads.contains('$clientId:$messageId')) {
+        throw const _DirectHostUploadCancelled();
+      }
     } catch (_) {
       if (await staging.exists()) await staging.delete(recursive: true);
       rethrow;
@@ -888,6 +1171,11 @@ class InviteHostController extends ChangeNotifier {
       '${root.path}${Platform.pathSeparator}$mediaId',
     );
     await staging.rename(destination.path);
+    if (isCancelled?.call() == true ||
+        _cancelledAdminUploads.contains('$clientId:$messageId')) {
+      if (await destination.exists()) await destination.delete(recursive: true);
+      throw const _DirectHostUploadCancelled();
+    }
     final trimmedName = fileName.replaceAll('\\', '/').split('/').last.trim();
     final media = <String, dynamic>{
       'id': mediaId,
@@ -933,11 +1221,10 @@ class InviteHostController extends ChangeNotifier {
       rethrow;
     }
     onProgress?.call(100);
-    AppLogger.log('message.sent', details: {
-      'type': 'attachment',
-      'mime_type': mimeType,
-      'bytes': fileSize,
-    });
+    AppLogger.log(
+      'message.sent',
+      details: {'type': 'attachment', 'mime_type': mimeType, 'bytes': fileSize},
+    );
     _notify();
     return message;
   }
@@ -957,10 +1244,10 @@ class InviteHostController extends ChangeNotifier {
   }
 
   Future<void> _handleRequest(HttpRequest request) async {
-    AppLogger.log('http.request', details: {
-      'method': request.method,
-      'route': request.uri.path,
-    });
+    AppLogger.log(
+      'http.request',
+      details: {'method': request.method, 'route': request.uri.path},
+    );
     if (request.method == 'GET' && request.uri.path == '/health') {
       await _respond(request, HttpStatus.ok, {'ok': true});
       return;
@@ -971,8 +1258,9 @@ class InviteHostController extends ChangeNotifier {
     }
     final clientIp = normalizeIp(request.connectionInfo!.remoteAddress.address);
     final requestClientId = request.headers.value('X-Client-Id');
-    final requestClient =
-        requestClientId == null ? null : _registeredClients[requestClientId];
+    final requestClient = requestClientId == null
+        ? null
+        : _registeredClients[requestClientId];
     _recordRequest(
       clientIp,
       clientId: requestClientId,
@@ -981,6 +1269,14 @@ class InviteHostController extends ChangeNotifier {
 
     if (request.method == 'POST' && request.uri.path == '/validate') {
       await _handleValidate(request, clientIp);
+      return;
+    }
+    if (request.uri.path == '/video-call/signals' && request.method == 'GET') {
+      await _handleClientVideoCallSignals(request);
+      return;
+    }
+    if (request.uri.path == '/video-call/signal' && request.method == 'POST') {
+      await _handleClientVideoCallSignal(request);
       return;
     }
     if (request.method == 'POST' && request.uri.path == '/messages/delete') {
@@ -1015,6 +1311,65 @@ class InviteHostController extends ChangeNotifier {
       return;
     }
     await _respond(request, HttpStatus.notFound, {'error': 'not_found'});
+  }
+
+  Future<void> _handleClientVideoCallSignals(HttpRequest request) async {
+    final clientId = request.headers.value('X-Client-Id');
+    final token = request.headers.value('X-Client-Token');
+    if (clientId == null || token == null) {
+      await _respond(request, HttpStatus.forbidden, {'error': 'unauthorized'});
+      return;
+    }
+    final client = _registeredClients[clientId];
+    if (client == null ||
+        !_constantTimeEquals(token, client['token'] as String)) {
+      await _respond(request, HttpStatus.forbidden, {'error': 'unauthorized'});
+      return;
+    }
+    await _respond(request, HttpStatus.ok, {
+      'signals': takeClientVideoCallEvents(clientId),
+    });
+  }
+
+  Future<void> _handleClientVideoCallSignal(HttpRequest request) async {
+    final clientId = request.headers.value('X-Client-Id');
+    final token = request.headers.value('X-Client-Token');
+    if (clientId == null || token == null) {
+      await _respond(request, HttpStatus.forbidden, {'error': 'unauthorized'});
+      return;
+    }
+    final client = _registeredClients[clientId];
+    if (client == null ||
+        !_constantTimeEquals(token, client['token'] as String)) {
+      await _respond(request, HttpStatus.forbidden, {'error': 'unauthorized'});
+      return;
+    }
+    final payload = await _readJsonPayload(request, 64 * 1024);
+    if (payload is! Map ||
+        payload['call_id'] is! String ||
+        payload['type'] is! String) {
+      await _respond(request, HttpStatus.badRequest, {
+        'error': 'invalid_request',
+      });
+      return;
+    }
+    try {
+      _addVideoCallSignal(
+        clientId: clientId,
+        callId: payload['call_id'] as String,
+        type: payload['type'] as String,
+        signal: {
+          if (payload['sdp'] != null) 'sdp': payload['sdp'],
+          if (payload['candidate'] != null) 'candidate': payload['candidate'],
+        },
+        fromClient: true,
+      );
+      await _respond(request, HttpStatus.ok, {'ok': true});
+    } on ArgumentError catch (error) {
+      await _respond(request, HttpStatus.badRequest, {'error': error.message});
+    } on StateError catch (error) {
+      await _respond(request, HttpStatus.conflict, {'error': error.message});
+    }
   }
 
   Future<void> _handleClientMessageDeletion(HttpRequest request) async {
@@ -1057,6 +1412,112 @@ class InviteHostController extends ChangeNotifier {
       await _respond(request, HttpStatus.forbidden, {'error': 'unauthorized'});
       return;
     }
+    if (request.method == 'POST' &&
+        request.uri.path == '/admin/video-call/start') {
+      final payload = await _readJsonPayload(request, 4096);
+      if (payload is! Map || payload['client_id'] is! String) {
+        await _respond(request, HttpStatus.badRequest, {
+          'error': 'invalid_request',
+        });
+        return;
+      }
+      try {
+        final callId = await startVideoCall(payload['client_id'] as String);
+        await _respond(request, HttpStatus.created, {
+          'call_id': callId,
+          'ice_servers': videoCallIceServers,
+        });
+      } on StateError catch (error) {
+        await _respond(request, HttpStatus.conflict, {'error': error.message});
+      } on FormatException catch (error) {
+        await _respond(request, HttpStatus.internalServerError, {
+          'error': error.message,
+        });
+      }
+      return;
+    }
+    if (request.method == 'GET' &&
+        request.uri.path == '/admin/video-call/signals') {
+      final clientId = request.uri.queryParameters['client_id'];
+      if (clientId == null || !_registeredClients.containsKey(clientId)) {
+        await _respond(request, HttpStatus.badRequest, {
+          'error': 'invalid_client',
+        });
+        return;
+      }
+      await _respond(request, HttpStatus.ok, {
+        'signals': takeAdminVideoCallEvents(clientId),
+      });
+      return;
+    }
+    if (request.method == 'POST' &&
+        request.uri.path == '/admin/video-call/signal') {
+      final payload = await _readJsonPayload(request, 64 * 1024);
+      if (payload is! Map ||
+          payload['client_id'] is! String ||
+          payload['call_id'] is! String ||
+          payload['type'] is! String) {
+        await _respond(request, HttpStatus.badRequest, {
+          'error': 'invalid_request',
+        });
+        return;
+      }
+      try {
+        _addVideoCallSignal(
+          clientId: payload['client_id'] as String,
+          callId: payload['call_id'] as String,
+          type: payload['type'] as String,
+          signal: {
+            if (payload['sdp'] != null) 'sdp': payload['sdp'],
+            if (payload['candidate'] != null) 'candidate': payload['candidate'],
+          },
+          fromClient: false,
+        );
+        await _respond(request, HttpStatus.ok, {'ok': true});
+      } on ArgumentError catch (error) {
+        await _respond(request, HttpStatus.badRequest, {
+          'error': error.message,
+        });
+      } on StateError catch (error) {
+        await _respond(request, HttpStatus.conflict, {'error': error.message});
+      }
+      return;
+    }
+    if (request.method == 'POST' &&
+        request.uri.path == '/admin/video-call/ice-servers') {
+      final payload = await _readJsonPayload(request, 4096);
+      if (payload is! Map ||
+          payload['stun_url'] is! String ||
+          payload['turn_url'] is! String ||
+          payload['turn_username'] is! String ||
+          payload['turn_password'] is! String) {
+        await _respond(request, HttpStatus.badRequest, {
+          'error': 'invalid_request',
+        });
+        return;
+      }
+      try {
+        await saveVideoCallIceServers(
+          stunUrl: payload['stun_url'] as String,
+          turnUrl: payload['turn_url'] as String,
+          turnUsername: payload['turn_username'] as String,
+          turnPassword: payload['turn_password'] as String,
+        );
+        await _respond(request, HttpStatus.ok, {'ok': true});
+      } on ArgumentError catch (error) {
+        await _respond(request, HttpStatus.badRequest, {
+          'error': error.message,
+        });
+      }
+      return;
+    }
+    if (request.method == 'GET' &&
+        request.uri.path == '/admin/video-call/ice-servers') {
+      await _respond(request, HttpStatus.ok, {
+        'ice_servers': videoCallIceServers,
+      });
+      return;
+    }
     if (request.method == 'POST' && request.uri.path == '/admin/media/start') {
       try {
         final payload = await _readJsonPayload(request, 64 * 1024);
@@ -1069,14 +1530,16 @@ class InviteHostController extends ChangeNotifier {
             (payload['preview_data'] != null &&
                 (payload['preview_data'] is! String ||
                     (payload['preview_data'] as String).length > 512 * 1024))) {
-          await _respond(
-              request, HttpStatus.badRequest, {'error': 'invalid_request'});
+          await _respond(request, HttpStatus.badRequest, {
+            'error': 'invalid_request',
+          });
           return;
         }
         final clientId = payload['client_id'] as String;
         if (!_registeredClients.containsKey(clientId)) {
-          await _respond(
-              request, HttpStatus.badRequest, {'error': 'invalid_client'});
+          await _respond(request, HttpStatus.badRequest, {
+            'error': 'invalid_client',
+          });
           return;
         }
         final existing = _messages.where(
@@ -1100,8 +1563,9 @@ class InviteHostController extends ChangeNotifier {
             fileName.isEmpty ||
             fileName.length > 255 ||
             (payload['mime_type'] as String).length > 128) {
-          await _respond(
-              request, HttpStatus.badRequest, {'error': 'invalid_attachment'});
+          await _respond(request, HttpStatus.badRequest, {
+            'error': 'invalid_attachment',
+          });
           return;
         }
         final root = await _getMediaRoot();
@@ -1127,8 +1591,10 @@ class InviteHostController extends ChangeNotifier {
         };
         await _respond(request, HttpStatus.created, {'upload_id': uploadId});
       } on FileSystemException catch (error) {
-        await _respond(
-            request, 507, {'error': 'disk_error', 'message': error.message});
+        await _respond(request, 507, {
+          'error': 'disk_error',
+          'message': error.message,
+        });
       }
       return;
     }
@@ -1138,8 +1604,9 @@ class InviteHostController extends ChangeNotifier {
       if (path.length == 4 && path[3] == 'cancel') {
         final upload = _uploads.remove(path[2]);
         if (upload == null || upload['admin_upload'] != true) {
-          await _respond(
-              request, HttpStatus.notFound, {'error': 'upload_not_found'});
+          await _respond(request, HttpStatus.notFound, {
+            'error': 'upload_not_found',
+          });
           return;
         }
         try {
@@ -1147,8 +1614,10 @@ class InviteHostController extends ChangeNotifier {
           if (await directory.exists()) await directory.delete(recursive: true);
           await _respond(request, HttpStatus.ok, {'ok': true});
         } on FileSystemException catch (error) {
-          await _respond(
-              request, 507, {'error': 'disk_error', 'message': error.message});
+          await _respond(request, 507, {
+            'error': 'disk_error',
+            'message': error.message,
+          });
         }
         return;
       }
@@ -1161,8 +1630,9 @@ class InviteHostController extends ChangeNotifier {
             index != upload['chunk_count'] ||
             request.contentLength <= 0 ||
             request.contentLength > 2 * 1024 * 1024) {
-          await _respond(
-              request, HttpStatus.badRequest, {'error': 'invalid_chunk'});
+          await _respond(request, HttpStatus.badRequest, {
+            'error': 'invalid_chunk',
+          });
           return;
         }
         try {
@@ -1205,11 +1675,14 @@ class InviteHostController extends ChangeNotifier {
           }
           await _respond(request, HttpStatus.ok, {'ok': true});
         } on FormatException {
-          await _respond(
-              request, HttpStatus.badRequest, {'error': 'invalid_chunk'});
+          await _respond(request, HttpStatus.badRequest, {
+            'error': 'invalid_chunk',
+          });
         } on FileSystemException catch (error) {
-          await _respond(
-              request, 507, {'error': 'disk_error', 'message': error.message});
+          await _respond(request, 507, {
+            'error': 'disk_error',
+            'message': error.message,
+          });
         }
         return;
       }
@@ -1217,8 +1690,9 @@ class InviteHostController extends ChangeNotifier {
         final uploadId = path[2];
         final upload = _uploads[uploadId];
         if (upload == null || upload['admin_upload'] != true) {
-          await _respond(
-              request, HttpStatus.notFound, {'error': 'upload_not_found'});
+          await _respond(request, HttpStatus.notFound, {
+            'error': 'upload_not_found',
+          });
           return;
         }
         try {
@@ -1232,9 +1706,8 @@ class InviteHostController extends ChangeNotifier {
           }
           final mediaId = _randomToken(18);
           final root = await _getMediaRoot();
-          await Directory(upload['directory'] as String).rename(
-            '${root.path}${Platform.pathSeparator}$mediaId',
-          );
+          await Directory(upload['directory'] as String)
+              .rename('${root.path}${Platform.pathSeparator}$mediaId');
           _media[mediaId] = {
             'id': mediaId,
             'client_id': upload['client_id'],
@@ -1267,11 +1740,14 @@ class InviteHostController extends ChangeNotifier {
           _notify();
           await _respond(request, HttpStatus.created, {'ok': true});
         } on FormatException {
-          await _respond(
-              request, HttpStatus.badRequest, {'error': 'invalid_attachment'});
+          await _respond(request, HttpStatus.badRequest, {
+            'error': 'invalid_attachment',
+          });
         } on FileSystemException catch (error) {
-          await _respond(
-              request, 507, {'error': 'disk_error', 'message': error.message});
+          await _respond(request, 507, {
+            'error': 'disk_error',
+            'message': error.message,
+          });
         }
         return;
       }
@@ -1289,12 +1765,14 @@ class InviteHostController extends ChangeNotifier {
       await _respond(request, HttpStatus.ok, {
         'allowed_ips': _allowedIps.toList(),
         'requests': _clients.values
-            .map((client) => {
+            .map(
+              (client) => {
                   'address': client.address,
                   'first_seen': client.firstSeen.toUtc().toIso8601String(),
                   'last_seen': client.lastSeen.toUtc().toIso8601String(),
                   'requests': client.requests,
-                })
+              },
+            )
             .toList(),
         'registered_clients': clients,
         'invite_codes': inviteCodes,
@@ -1597,16 +2075,12 @@ class InviteHostController extends ChangeNotifier {
   Future<void> _handleAdminLogUpload(HttpRequest request) async {
     final payload = await _readJsonPayload(request, 6 * 1024 * 1024);
     if (payload is! Map || payload['content'] is! String) {
-      await _respond(request, HttpStatus.badRequest, {
-        'error': 'invalid_log',
-      });
+      await _respond(request, HttpStatus.badRequest, {'error': 'invalid_log'});
       return;
     }
     final content = payload['content'] as String;
     if (content.isEmpty || utf8.encode(content).length > 5 * 1024 * 1024) {
-      await _respond(request, HttpStatus.badRequest, {
-        'error': 'invalid_log',
-      });
+      await _respond(request, HttpStatus.badRequest, {'error': 'invalid_log'});
       return;
     }
     try {
@@ -1614,10 +2088,10 @@ class InviteHostController extends ChangeNotifier {
         fileName: 'server-mobile',
         content: content,
       );
-      AppLogger.log('logs.received', details: {
-        'app': 'server-mobile',
-        'bytes': utf8.encode(content).length,
-      });
+      AppLogger.log(
+        'logs.received',
+        details: {'app': 'server-mobile', 'bytes': utf8.encode(content).length},
+      );
       await _respond(request, HttpStatus.ok, {'ok': true});
     } catch (error, stackTrace) {
       AppLogger.log(
@@ -1757,16 +2231,12 @@ class InviteHostController extends ChangeNotifier {
     }
     final payload = await _readJsonPayload(request, 6 * 1024 * 1024);
     if (payload is! Map || payload['content'] is! String) {
-      await _respond(request, HttpStatus.badRequest, {
-        'error': 'invalid_log',
-      });
+      await _respond(request, HttpStatus.badRequest, {'error': 'invalid_log'});
       return;
     }
     final content = payload['content'] as String;
     if (content.isEmpty || utf8.encode(content).length > 2 * 1024 * 1024) {
-      await _respond(request, HttpStatus.badRequest, {
-        'error': 'invalid_log',
-      });
+      await _respond(request, HttpStatus.badRequest, {'error': 'invalid_log'});
       return;
     }
     try {
@@ -1774,10 +2244,10 @@ class InviteHostController extends ChangeNotifier {
         fileName: 'client-mobile',
         content: content,
       );
-      AppLogger.log('logs.received', details: {
-        'app': 'client-mobile',
-        'bytes': utf8.encode(content).length,
-      });
+      AppLogger.log(
+        'logs.received',
+        details: {'app': 'client-mobile', 'bytes': utf8.encode(content).length},
+      );
       await _respond(request, HttpStatus.ok, {'ok': true});
     } catch (error, stackTrace) {
       AppLogger.log(
@@ -1850,8 +2320,10 @@ class InviteHostController extends ChangeNotifier {
     final requestedClientId = (payload['client_id'] as String).trim();
     final clientName = (payload['client_name'] as String).trim();
     final deviceIdentity = (payload['device_identity'] as String? ?? '').trim();
-    final deviceName = (payload['device_name'] as String? ??
-            _registeredClients[requestedClientId]?['device_name'] as String? ??
+    final deviceName =
+        (payload['device_name'] as String? ??
+                _registeredClients[requestedClientId]?['device_name']
+                    as String? ??
             clientName)
         .trim();
     final suppliedToken = payload['token'] as String;
@@ -1926,10 +2398,7 @@ class InviteHostController extends ChangeNotifier {
           client['client_id'] != clientId &&
           client['revoked'] != true &&
           client['invite_code'] is String &&
-          _constantTimeEquals(
-            client['invite_code'] as String,
-            suppliedCode,
-          ),
+          _constantTimeEquals(client['invite_code'] as String, suppliedCode),
     );
     if (codeOwner) {
       recentFailures.add(DateTime.now());
@@ -1965,7 +2434,8 @@ class InviteHostController extends ChangeNotifier {
       });
       return;
     }
-    final token = existing != null &&
+    final token =
+        existing != null &&
             _constantTimeEquals(suppliedToken, existing['token'] as String)
         ? existing['token'] as String
         : _randomToken(32);
@@ -2008,9 +2478,11 @@ class InviteHostController extends ChangeNotifier {
       return;
     }
     final now = DateTime.now().toUtc();
-    final previousSeen =
-        DateTime.tryParse(client['last_seen']?.toString() ?? '');
-    final shouldPersist = client['ip'] != clientIp ||
+    final previousSeen = DateTime.tryParse(
+      client['last_seen']?.toString() ?? '',
+    );
+    final shouldPersist =
+        client['ip'] != clientIp ||
         previousSeen == null ||
         now.difference(previousSeen) >= const Duration(seconds: 30);
     client['ip'] = clientIp;
@@ -2020,13 +2492,14 @@ class InviteHostController extends ChangeNotifier {
     }
     if (request.method == 'GET') {
       await _respond(request, HttpStatus.ok, {
-        'messages_cipher': DailyInviteCipher(
-          client['invite_code'] as String,
-        ).encrypt(jsonEncode(
+        'messages_cipher': DailyInviteCipher(client['invite_code'] as String)
+            .encrypt(
+              jsonEncode(
           messagesFor(clientId)
               .where((message) => message['pending'] != true)
               .toList(),
-        )),
+              ),
+            ),
       });
       return;
     }
@@ -2107,15 +2580,17 @@ class InviteHostController extends ChangeNotifier {
       final client = clientId == null ? null : _registeredClients[clientId];
       if (client == null ||
           !_constantTimeEquals(token ?? '', client['token'] as String)) {
-        await _respond(
-            request, HttpStatus.forbidden, {'error': 'unauthorized'});
+        await _respond(request, HttpStatus.forbidden, {
+          'error': 'unauthorized',
+        });
         return;
       }
       try {
         final payload = await _readJsonPayload(request, 64 * 1024);
         if (payload is! Map || payload['metadata_cipher'] is! String) {
-          await _respond(
-              request, HttpStatus.badRequest, {'error': 'invalid_request'});
+          await _respond(request, HttpStatus.badRequest, {
+            'error': 'invalid_request',
+          });
           return;
         }
         final metadata = jsonDecode(
@@ -2206,8 +2681,9 @@ class InviteHostController extends ChangeNotifier {
           'chunk_count': 0,
           'received_bytes': 0,
         };
-        _registeredClients[clientId]!['last_seen'] =
-            DateTime.now().toUtc().toIso8601String();
+        _registeredClients[clientId]!['last_seen'] = DateTime.now()
+            .toUtc()
+            .toIso8601String();
         _registeredClients[clientId]!['ip'] = clientIp;
         await _saveRegisteredClients();
         await _respond(request, HttpStatus.created, {
@@ -2215,11 +2691,14 @@ class InviteHostController extends ChangeNotifier {
           'next_chunk': 0,
         });
       } on FormatException {
-        await _respond(
-            request, HttpStatus.badRequest, {'error': 'invalid_attachment'});
+        await _respond(request, HttpStatus.badRequest, {
+          'error': 'invalid_attachment',
+        });
       } on FileSystemException catch (error) {
-        await _respond(
-            request, 507, {'error': 'disk_error', 'message': error.message});
+        await _respond(request, 507, {
+          'error': 'disk_error',
+          'message': error.message,
+        });
       }
     }
 
@@ -2229,8 +2708,9 @@ class InviteHostController extends ChangeNotifier {
       final client = clientId == null ? null : _registeredClients[clientId];
       if (client == null ||
           !_constantTimeEquals(token ?? '', client['token'] as String)) {
-        await _respond(
-            request, HttpStatus.forbidden, {'error': 'unauthorized'});
+        await _respond(request, HttpStatus.forbidden, {
+          'error': 'unauthorized',
+        });
         return;
       }
       final parts = request.uri.pathSegments;
@@ -2242,8 +2722,9 @@ class InviteHostController extends ChangeNotifier {
         if (upload == null ||
             upload['client_id'] != clientId ||
             upload['admin_upload'] == true) {
-          await _respond(
-              request, HttpStatus.notFound, {'error': 'upload_not_found'});
+          await _respond(request, HttpStatus.notFound, {
+            'error': 'upload_not_found',
+          });
           return;
         }
         try {
@@ -2252,8 +2733,10 @@ class InviteHostController extends ChangeNotifier {
           _uploads.remove(parts[1]);
           await _respond(request, HttpStatus.ok, {'ok': true});
         } on FileSystemException catch (error) {
-          await _respond(
-              request, 507, {'error': 'disk_error', 'message': error.message});
+          await _respond(request, 507, {
+            'error': 'disk_error',
+            'message': error.message,
+          });
         }
         return;
       }
@@ -2265,8 +2748,9 @@ class InviteHostController extends ChangeNotifier {
         if (upload == null ||
             upload['client_id'] != clientId ||
             upload['admin_upload'] == true) {
-          await _respond(
-              request, HttpStatus.notFound, {'error': 'upload_not_found'});
+          await _respond(request, HttpStatus.notFound, {
+            'error': 'upload_not_found',
+          });
           return;
         }
         final index = int.tryParse(parts[3]);
@@ -2274,8 +2758,9 @@ class InviteHostController extends ChangeNotifier {
             index != upload['chunk_count'] ||
             request.contentLength <= 0 ||
             request.contentLength > 2 * 1024 * 1024) {
-          await _respond(
-              request, HttpStatus.badRequest, {'error': 'invalid_chunk'});
+          await _respond(request, HttpStatus.badRequest, {
+            'error': 'invalid_chunk',
+          });
           return;
         }
         try {
@@ -2317,11 +2802,14 @@ class InviteHostController extends ChangeNotifier {
           }
           await _respond(request, HttpStatus.ok, {'ok': true});
         } on FormatException {
-          await _respond(
-              request, HttpStatus.badRequest, {'error': 'invalid_chunk'});
+          await _respond(request, HttpStatus.badRequest, {
+            'error': 'invalid_chunk',
+          });
         } on FileSystemException catch (error) {
-          await _respond(
-              request, 507, {'error': 'disk_error', 'message': error.message});
+          await _respond(request, 507, {
+            'error': 'disk_error',
+            'message': error.message,
+          });
         }
         return;
       }
@@ -2334,8 +2822,9 @@ class InviteHostController extends ChangeNotifier {
         if (upload == null ||
             upload['client_id'] != clientId ||
             upload['admin_upload'] == true) {
-          await _respond(
-              request, HttpStatus.notFound, {'error': 'upload_not_found'});
+          await _respond(request, HttpStatus.notFound, {
+            'error': 'upload_not_found',
+          });
           return;
         }
         try {
@@ -2401,11 +2890,14 @@ class InviteHostController extends ChangeNotifier {
                 .encrypt(jsonEncode(message)),
           });
         } on FormatException {
-          await _respond(
-              request, HttpStatus.badRequest, {'error': 'invalid_attachment'});
+          await _respond(request, HttpStatus.badRequest, {
+            'error': 'invalid_attachment',
+          });
         } on FileSystemException catch (error) {
-          await _respond(
-              request, 507, {'error': 'disk_error', 'message': error.message});
+          await _respond(request, 507, {
+            'error': 'disk_error',
+            'message': error.message,
+          });
         }
         return;
       }
@@ -2483,8 +2975,9 @@ class InviteHostController extends ChangeNotifier {
         data: content['data'] as String,
         body: content['body'] as String,
       );
-      _registeredClients[clientId]!['last_seen'] =
-          DateTime.now().toUtc().toIso8601String();
+      _registeredClients[clientId]!['last_seen'] = DateTime.now()
+          .toUtc()
+          .toIso8601String();
       _registeredClients[clientId]!['ip'] = clientIp;
       await _saveRegisteredClients();
       _notify();
@@ -2502,9 +2995,7 @@ class InviteHostController extends ChangeNotifier {
         'error': 'invalid_attachment',
       });
     } on StateError {
-      await _respond(request, 413, {
-        'error': 'storage_limit',
-      });
+      await _respond(request, 413, {'error': 'storage_limit'});
     }
   }
 
@@ -2539,11 +3030,7 @@ class InviteHostController extends ChangeNotifier {
           '${mediaDirectory.path}${Platform.pathSeparator}$index.chunk',
         );
         if (media['encrypted'] == false) {
-          await _respondBytes(
-            request,
-            HttpStatus.ok,
-            await file.readAsBytes(),
-          );
+          await _respondBytes(request, HttpStatus.ok, await file.readAsBytes());
         } else {
           await _respond(request, HttpStatus.ok, {
             'chunk_cipher': await file.readAsString(),
@@ -2558,18 +3045,20 @@ class InviteHostController extends ChangeNotifier {
       return;
     }
     if (media['data'] is! String) {
-      await _respond(
-          request, HttpStatus.badRequest, {'error': 'chunk_required'});
+      await _respond(request, HttpStatus.badRequest, {
+        'error': 'chunk_required',
+      });
       return;
     }
     await _respond(request, HttpStatus.ok, {
-      'content_cipher': DailyInviteCipher(
-        client['invite_code'] as String,
-      ).encrypt(jsonEncode({
+      'content_cipher': DailyInviteCipher(client['invite_code'] as String)
+          .encrypt(
+            jsonEncode({
         'file_name': media['file_name'] as String,
         'mime_type': media['mime_type'] as String,
         'data': media['data'] as String,
-      })),
+            }),
+          ),
     });
   }
 
@@ -2612,11 +3101,11 @@ class InviteHostController extends ChangeNotifier {
     final cipher = DailyInviteCipher(client['invite_code'] as String);
     for (var offset = 0; offset < bytes.length; offset += chunkSize) {
       final end = (offset + chunkSize).clamp(0, bytes.length);
-      final encrypted =
-          cipher.encrypt(base64Encode(bytes.sublist(offset, end)));
-      await File(
-        '${directory.path}${Platform.pathSeparator}$chunkCount.chunk',
-      ).writeAsString(encrypted, flush: true);
+      final encrypted = cipher.encrypt(
+        base64Encode(bytes.sublist(offset, end)),
+      );
+      await File('${directory.path}${Platform.pathSeparator}$chunkCount.chunk')
+          .writeAsString(encrypted, flush: true);
       chunkCount++;
     }
     final media = <String, dynamic>{
@@ -2648,6 +3137,7 @@ class InviteHostController extends ChangeNotifier {
 
   Future<void> _loadSavedState() async {
     if (_savedStateLoaded) return;
+    await _importVideoCallIceServers();
     final storedIps = _cache.value(_allowedIpsKey);
     if (storedIps is List) {
       _allowedIps.addAll(storedIps.whereType<String>());
@@ -2703,7 +3193,8 @@ class InviteHostController extends ChangeNotifier {
               message['delivery_state'] == 'queued')) {
         var filePath = message['file_path'] as String?;
         final expectedSize = message['media_size'];
-        var hasFile = filePath != null &&
+        var hasFile =
+            filePath != null &&
             expectedSize is int &&
             await File(filePath).exists() &&
             await File(filePath).length() == expectedSize;
@@ -2711,8 +3202,9 @@ class InviteHostController extends ChangeNotifier {
             filePath != null &&
             expectedSize is int &&
             message['file_name'] is String) {
-          final extension =
-              _pendingAttachmentExtension(message['file_name'] as String);
+          final extension = _pendingAttachmentExtension(
+            message['file_name'] as String,
+          );
           if (extension != '.attachment') {
             final recoveredPath =
                 '${File(filePath).parent.path}${Platform.pathSeparator}'
@@ -2756,9 +3248,8 @@ class InviteHostController extends ChangeNotifier {
           var count = 0;
           for (var offset = 0; offset < bytes.length; offset += chunkSize) {
             final end = (offset + chunkSize).clamp(0, bytes.length);
-            await File(
-              '${directory.path}${Platform.pathSeparator}$count.chunk',
-            ).writeAsString(
+            await File('${directory.path}${Platform.pathSeparator}$count.chunk')
+                .writeAsString(
               cipher.encrypt(base64Encode(bytes.sublist(offset, end))),
               flush: true,
             );
@@ -2805,10 +3296,7 @@ class InviteHostController extends ChangeNotifier {
       _availableInviteCodesKey,
       _availableInviteCodes.toList(),
     );
-    await _cache.putValue(
-      _invalidInviteCodesKey,
-      _invalidInviteCodes.toList(),
-    );
+    await _cache.putValue(_invalidInviteCodesKey, _invalidInviteCodes.toList());
     await _cache.putValue(
       _inviteCodeCreatedAtKey,
       Map<String, String>.from(_inviteCodeCreatedAt),
@@ -2820,8 +3308,9 @@ class InviteHostController extends ChangeNotifier {
     DateTime? latest;
     for (final message in _messages) {
       if (message['client_id'] != clientId) continue;
-      final timestamp =
-          DateTime.tryParse(message['created_at']?.toString() ?? '');
+      final timestamp = DateTime.tryParse(
+        message['created_at']?.toString() ?? '',
+      );
       if (timestamp != null && (latest == null || timestamp.isAfter(latest))) {
         latest = timestamp;
       }
@@ -2836,11 +3325,7 @@ class InviteHostController extends ChangeNotifier {
     ).replaceAll('=', '');
   }
 
-  void _recordRequest(
-    String clientIp, {
-    String? clientId,
-    String? clientName,
-  }) {
+  void _recordRequest(String clientIp, {String? clientId, String? clientName}) {
     final previous = _clients[clientIp];
     if (previous == null && _clients.length >= 2048) {
       final oldest = _clients.values.reduce(
@@ -2883,11 +3368,14 @@ class InviteHostController extends ChangeNotifier {
     int status,
     Map<String, Object?> payload,
   ) async {
-    AppLogger.log('http.response', details: {
+    AppLogger.log(
+      'http.response',
+      details: {
       'method': request.method,
       'route': request.uri.path,
       'status': status,
-    });
+      },
+    );
     request.response
       ..statusCode = status
       ..headers.contentType = ContentType.json
@@ -2902,11 +3390,14 @@ class InviteHostController extends ChangeNotifier {
     int status,
     List<int> bytes,
   ) async {
-    AppLogger.log('http.response', details: {
+    AppLogger.log(
+      'http.response',
+      details: {
       'method': request.method,
       'route': request.uri.path,
       'status': status,
-    });
+      },
+    );
     request.response
       ..statusCode = status
       ..headers.contentType = ContentType('application', 'octet-stream')
@@ -2972,8 +3463,10 @@ String normalizeIp(String address) {
     return groups.map((group) => group.toRadixString(16)).join(':');
   }
 
-  final before =
-      groups.take(bestStart).map((group) => group.toRadixString(16)).join(':');
+  final before = groups
+      .take(bestStart)
+      .map((group) => group.toRadixString(16))
+      .join(':');
   final after = groups
       .skip(bestStart + bestLength)
       .map((group) => group.toRadixString(16))
@@ -3000,12 +3493,14 @@ class InviteHostApp extends StatefulWidget {
   const InviteHostApp({
     this.onBack,
     this.bindAddress,
+    this.autoStartServer = false,
     required this.cache,
     super.key,
   });
 
   final VoidCallback? onBack;
   final InternetAddress? bindAddress;
+  final bool autoStartServer;
   final InviteHostStore cache;
 
   @override
@@ -3033,9 +3528,15 @@ class _InviteHostAppState extends State<InviteHostApp> {
   void initState() {
     super.initState();
     _controller = InviteHostController(widget.cache);
-    _code.text = widget.cache.value('direct-host-admin-code') as String? ??
+    _code.text =
+        widget.cache.value('direct-host-admin-code') as String? ??
         widget.cache.value('remote-admin-code') as String? ??
         '';
+    if (widget.autoStartServer && _code.text.trim().isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_toggleServer());
+      });
+    }
   }
 
   @override
@@ -3050,9 +3551,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
     super.dispose();
   }
 
-  Future<void> _uploadPendingAdminMessage(
-    Map<String, dynamic> message,
-  ) async {
+  Future<void> _uploadPendingAdminMessage(Map<String, dynamic> message) async {
     final messageId = message['id'].toString();
     if (!_queuedAdminUploadIds.add(messageId)) return;
     final queued = _adminUploadQueue.then(
@@ -3110,11 +3609,9 @@ class _InviteHostAppState extends State<InviteHostApp> {
           await sourceFile.rename(renamedPath);
         }
         filePath = renamedPath;
-        await _controller.updatePendingMediaMessage(
-          clientId,
-          messageId,
-          {'file_path': filePath},
-        );
+        await _controller.updatePendingMediaMessage(clientId, messageId, {
+          'file_path': filePath,
+        });
       }
       var previewData = message['preview_data'] as String?;
       final mimeType = message['mime_type'] as String;
@@ -3126,22 +3623,16 @@ class _InviteHostAppState extends State<InviteHostApp> {
         );
         if (previewData != null) {
           message['preview_data'] = previewData;
-          await _controller.updatePendingMediaMessage(
-            clientId,
-            messageId,
-            {'preview_data': previewData},
-          );
+          await _controller.updatePendingMediaMessage(clientId, messageId, {
+            'preview_data': previewData,
+          });
         }
       }
-      await _controller.updatePendingMediaMessage(
-        clientId,
-        messageId,
-        {
+      await _controller.updatePendingMediaMessage(clientId, messageId, {
           'delivery_state': 'uploading',
           'upload_progress': 0,
           'pending': true,
-        },
-      );
+      });
       await _controller.sendMediaFile(
         clientId: clientId,
         messageId: messageId,
@@ -3150,17 +3641,19 @@ class _InviteHostAppState extends State<InviteHostApp> {
         filePath: filePath,
         fileSize: fileSize,
         previewData: previewData,
+        isCancelled: () =>
+            _controller.isAdminUploadCancelled(clientId, messageId),
         onProgress: (progress) {
-          unawaited(_controller.updatePendingMediaMessage(
-            clientId,
-            messageId,
-            {'upload_progress': progress},
-            persist: false,
-          ));
+          unawaited(
+            _controller.updatePendingMediaMessage(clientId, messageId, {
+              'upload_progress': progress,
+            }, persist: false),
+          );
         },
       );
       await _controller.rememberLocalMediaPath(clientId, messageId, filePath);
     } catch (error, stackTrace) {
+      if (_controller.isAdminUploadCancelled(clientId, messageId)) return;
       AppLogger.log(
         'admin.attachment_upload_failed',
         level: 'error',
@@ -3168,19 +3661,16 @@ class _InviteHostAppState extends State<InviteHostApp> {
         error: error,
         stackTrace: stackTrace,
       );
-      await _controller.updatePendingMediaMessage(
-        clientId,
-        messageId,
-        {
+      await _controller.updatePendingMediaMessage(clientId, messageId, {
           'delivery_state': 'failed',
           'upload_error': error.toString(),
-        },
-      );
+      });
       if (mounted) {
         setState(() => _error = '附件发送失败，可在聊天中重试：$error');
       }
     } finally {
       _activeAdminUploads.remove(messageId);
+      _controller.clearAdminUploadCancellation(clientId, messageId);
     }
   }
 
@@ -3211,11 +3701,123 @@ class _InviteHostAppState extends State<InviteHostApp> {
       );
       AppLogger.log('server.start_succeeded', details: {'port': port});
     } catch (error) {
-      AppLogger.log('server.start_or_stop_failed',
-          level: 'error', error: error);
+      AppLogger.log(
+        'server.start_or_stop_failed',
+        level: 'error',
+        error: error,
+      );
       if (mounted) setState(() => _error = 'Could not start server: $error');
     } finally {
       if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _showVideoCallIceSettings(BuildContext context) async {
+    final iceServers = _controller.videoCallIceServers;
+    String urlFrom(Map<String, dynamic> server) {
+      final urls = server['urls'];
+      if (urls is String) return urls;
+      if (urls is List && urls.isNotEmpty && urls.first is String) {
+        return urls.first as String;
+      }
+      return '';
+    }
+
+    final stunController = TextEditingController(
+      text: iceServers.isEmpty
+          ? 'stun:stun.l.google.com:19302'
+          : urlFrom(iceServers.first),
+    );
+    final turnServer = iceServers.length > 1 ? iceServers[1] : null;
+    final turnUrlController = TextEditingController(
+      text: turnServer == null ? '' : urlFrom(turnServer),
+    );
+    final turnUsernameController = TextEditingController(
+      text: turnServer?['username'] as String? ?? '',
+    );
+    final turnPasswordController = TextEditingController(
+      text: turnServer?['credential'] as String? ?? '',
+    );
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('视频通话网络设置'),
+          content: SizedBox(
+            width: 440,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: stunController,
+                    decoration: const InputDecoration(labelText: 'STUN 地址'),
+                  ),
+                  TextField(
+                    controller: turnUrlController,
+                    decoration: const InputDecoration(
+                      labelText: 'TURN 地址（跨互联网推荐）',
+                      hintText: 'turn:turn.example.com:3478',
+                    ),
+                  ),
+                  TextField(
+                    controller: turnUsernameController,
+                    decoration: const InputDecoration(labelText: 'TURN 用户名'),
+                  ),
+                  TextField(
+                    controller: turnPasswordController,
+                    obscureText: true,
+                    decoration: const InputDecoration(labelText: 'TURN 密码'),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'TURN 服务器需要另外部署。未配置 TURN 时，跨互联网通话可能无法连接；密码仅保存在服务端本机加密数据中。',
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () async {
+                try {
+                  await _controller.saveVideoCallIceServers(
+                    stunUrl: stunController.text,
+                    turnUrl: turnUrlController.text,
+                    turnUsername: turnUsernameController.text,
+                    turnPassword: turnPasswordController.text,
+                  );
+                  if (dialogContext.mounted) {
+                    Navigator.of(dialogContext).pop();
+                  }
+                  if (messenger.mounted) {
+                    messenger.showSnackBar(
+                      const SnackBar(content: Text('通话网络设置已保存。')),
+                    );
+                  }
+                } catch (error) {
+                  if (dialogContext.mounted) {
+                    ScaffoldMessenger.of(dialogContext).showSnackBar(
+                      SnackBar(content: Text('保存通话网络设置失败：$error')),
+                    );
+                  }
+                }
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      stunController.dispose();
+      turnUrlController.dispose();
+      turnUsernameController.dispose();
+      turnPasswordController.dispose();
     }
   }
 
@@ -3257,9 +3859,8 @@ class _InviteHostAppState extends State<InviteHostApp> {
       onAdded?.call();
       if (mounted) setState(() {});
       if (mounted && context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('客户端邀请码已添加。')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('客户端邀请码已添加。')));
       }
     } catch (error) {
       if (mounted) setState(() => _error = error.toString());
@@ -3281,7 +3882,9 @@ class _InviteHostAppState extends State<InviteHostApp> {
             shrinkWrap: true,
             children: [
               ListTile(
-                  title: const Text('邀请码'), subtitle: SelectableText(code)),
+                title: const Text('邀请码'),
+                subtitle: SelectableText(code),
+              ),
               ListTile(
                 title: const Text('状态'),
                 subtitle: Text(invite['status'].toString()),
@@ -3355,8 +3958,9 @@ class _InviteHostAppState extends State<InviteHostApp> {
                   children: [
                     ListTile(
                       title: const Text('姓名'),
-                      subtitle:
-                          SelectableText(client['client_name'].toString()),
+                      subtitle: SelectableText(
+                        client['client_name'].toString(),
+                      ),
                     ),
                     ListTile(
                       title: const Text('手机名称'),
@@ -3403,18 +4007,18 @@ class _InviteHostAppState extends State<InviteHostApp> {
                       ListTile(
                         title: const Text('首次注册'),
                         subtitle: SelectableText(
-                          _dateTime(DateTime.parse(
-                            client['created_at'] as String,
-                          )),
+                          _dateTime(
+                            DateTime.parse(client['created_at'] as String),
+                          ),
                         ),
                       ),
                     if (client['last_seen'] is String)
                       ListTile(
                         title: const Text('最近活动'),
                         subtitle: SelectableText(
-                          _dateTime(DateTime.parse(
-                            client['last_seen'] as String,
-                          )),
+                          _dateTime(
+                            DateTime.parse(client['last_seen'] as String),
+                          ),
                         ),
                       ),
                     const SizedBox(height: 8),
@@ -3431,8 +4035,8 @@ class _InviteHostAppState extends State<InviteHostApp> {
                       onPressed: buildingApk || !Platform.isWindows
                           ? null
                           : () async {
-                              final deviceIdentity =
-                                  _controller.deviceIdentityForClient(clientId);
+                              final deviceIdentity = _controller
+                                  .deviceIdentityForClient(clientId);
                               if (deviceIdentity == null) {
                                 ScaffoldMessenger.of(dialogContext)
                                     .showSnackBar(
@@ -3455,7 +4059,8 @@ class _InviteHostAppState extends State<InviteHostApp> {
                                   ScaffoldMessenger.of(dialogContext)
                                       .showSnackBar(
                                     SnackBar(
-                                        content: Text('APK 已生成：$outputPath')),
+                                          content: Text('APK 已生成：$outputPath'),
+                                        ),
                                   );
                                 }
                               } catch (error) {
@@ -3478,9 +4083,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : const Icon(Icons.android),
-                      label: Text(
-                        buildingApk ? '正在编译，请稍候…' : '为此设备编译唯一 APK',
-                      ),
+                      label: Text(buildingApk ? '正在编译，请稍候…' : '为此设备编译唯一 APK'),
                     ),
                   ],
                 ),
@@ -3499,9 +4102,9 @@ class _InviteHostAppState extends State<InviteHostApp> {
                       if (dialogContext.mounted) Navigator.pop(dialogContext);
                     } catch (error) {
                       if (dialogContext.mounted) {
-                        ScaffoldMessenger.of(dialogContext).showSnackBar(
-                          SnackBar(content: Text('撤销失败：$error')),
-                        );
+                        ScaffoldMessenger.of(
+                          dialogContext,
+                        ).showSnackBar(SnackBar(content: Text('撤销失败：$error')));
                       }
                     }
                   },
@@ -3554,15 +4157,11 @@ class _InviteHostAppState extends State<InviteHostApp> {
     controller.dispose();
     if (remark == null) return;
     try {
-      await _controller.setClientRemark(
-        client['client_id'] as String,
-        remark,
-      );
+      await _controller.setClientRemark(client['client_id'] as String, remark);
     } catch (error) {
       if (mounted && context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('保存备注失败：$error')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('保存备注失败：$error')));
       }
     }
   }
@@ -3582,11 +4181,8 @@ class _InviteHostAppState extends State<InviteHostApp> {
     try {
       await _controller.changeClientInviteCode(clientId, newCode);
       if (mounted && context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('邀请码已更新，旧客户端的授权将被撤销。'),
-          ),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('邀请码已更新，旧客户端的授权将被撤销。')));
       }
     } catch (error) {
       if (mounted) {
@@ -3636,8 +4232,9 @@ class _InviteHostAppState extends State<InviteHostApp> {
     final recorder = AudioRecorder();
     final screenSize = MediaQuery.of(context).size;
     final chatWidth = (screenSize.width - 96).clamp(240.0, 900.0).toDouble();
-    final messageHeight =
-        (screenSize.height - 400).clamp(120.0, 600.0).toDouble();
+    final messageHeight = (screenSize.height - 400)
+        .clamp(120.0, 600.0)
+        .toDouble();
     String? mediaError;
     var recording = false;
     var dialogOpen = true;
@@ -3655,7 +4252,8 @@ class _InviteHostAppState extends State<InviteHostApp> {
       void Function(void Function()) setDialogState,
     ) async {
       final messageId = message['id'].toString();
-      final localPath = message['media_path'] as String? ??
+      final localPath =
+          message['media_path'] as String? ??
           _controller.localMediaPathForMessage(clientId, messageId) ??
           (message['encrypted_local'] == true
               ? null
@@ -3664,7 +4262,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
         final localFile = File(localPath);
         if (await localFile.exists() && await localFile.length() > 0) {
           message['media_path'] = localPath;
-          final error = await openDirectAttachment(message);
+          final error = await openDirectAttachment(message, context: context);
           if (error != null && context.mounted) {
             ScaffoldMessenger.of(context)
                 .showSnackBar(SnackBar(content: Text(error)));
@@ -3682,8 +4280,9 @@ class _InviteHostAppState extends State<InviteHostApp> {
           final path = await DirectAttachmentDownloads.instance.download(
             key: 'host:$clientId:$mediaId',
             expectedSize: message['media_size'] as int? ?? 0,
-            sequential:
-                (message['mime_type'] as String? ?? '').startsWith('video/'),
+            sequential: (message['mime_type'] as String? ?? '').startsWith(
+              'video/',
+            ),
             onProgress: (progress) {
               downloadProgress[messageId] = progress;
               if (dialogOpen) setDialogState(() {});
@@ -3700,7 +4299,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
           if (dialogOpen) setDialogState(() {});
         }
         if (!dialogOpen) return;
-        final error = await openDirectAttachment(message);
+        final error = await openDirectAttachment(message, context: context);
         if (error != null && context.mounted) {
           ScaffoldMessenger.of(context)
               .showSnackBar(SnackBar(content: Text(error)));
@@ -3709,9 +4308,8 @@ class _InviteHostAppState extends State<InviteHostApp> {
         // The user cancelled; the incomplete file has already been removed.
       } catch (error) {
         if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('无法下载附件：$error')),
-          );
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text('无法下载附件：$error')));
         }
       } finally {
         downloadingMessageIds.remove(messageId);
@@ -3731,7 +4329,8 @@ class _InviteHostAppState extends State<InviteHostApp> {
     ]) async {
       if (isRevoked) return;
       final messageId = retryMessage?['id'] as String? ?? _uuid.v4();
-      final temporary = retryMessage ??
+      final temporary =
+          retryMessage ??
           <String, dynamic>{
             'id': messageId,
             'client_id': clientId,
@@ -3776,7 +4375,8 @@ class _InviteHostAppState extends State<InviteHostApp> {
         final reusablePath = retryPath is String ? retryPath : sourcePath;
         if (reusablePath != null &&
             reusablePath.startsWith(
-                '${pendingDirectory.path}${Platform.pathSeparator}') &&
+              '${pendingDirectory.path}${Platform.pathSeparator}',
+            ) &&
             await File(reusablePath).exists() &&
             await File(reusablePath).length() == fileSize) {
           if (reusablePath == desiredPath) {
@@ -3787,7 +4387,8 @@ class _InviteHostAppState extends State<InviteHostApp> {
           }
         } else {
           localPath = desiredPath;
-          final stream = sourceStream ??
+          final stream =
+              sourceStream ??
               (sourcePath == null ? null : File(sourcePath).openRead());
           if (stream == null) throw const FileSystemException('无法读取所选文件。');
           final outputFile = File(localPath);
@@ -3912,21 +4513,21 @@ class _InviteHostAppState extends State<InviteHostApp> {
               });
             }
             final messagesById = {
-              for (final message
-                  in _controller.messagesFor(clientId, includeExpired: true))
+              for (final message in _controller.messagesFor(
+                clientId,
+                includeExpired: true,
+              ))
                 message['id'].toString(): message,
               for (final message in optimisticMessages)
                 message['id'].toString(): message,
             };
             final messages = messagesById.values.toList()
               ..sort(compareDirectMessages);
-            final selectableMessages = messages
-                .where((message) => message['pending'] != true)
-                .toList();
-            final selectableMessageIds = selectableMessages
+            final selectableMessageIds = messages
                 .map((message) => message['id'].toString())
                 .toSet();
-            final allMessagesSelected = selectableMessageIds.isNotEmpty &&
+            final allMessagesSelected =
+                selectableMessageIds.isNotEmpty &&
                 selectedMessageIds.containsAll(selectableMessageIds);
             Future<void> sendText() async {
               final body = input.text.trim();
@@ -3963,6 +4564,39 @@ class _InviteHostAppState extends State<InviteHostApp> {
               } catch (error) {
                 if (dialogOpen) {
                   setDialogState(() => _error = '发送震动提醒失败：$error');
+                }
+              }
+            }
+
+            Future<void> startVideoCall() async {
+              try {
+                final callId = await _controller.startVideoCall(clientId);
+                final iceServers = _controller.videoCallIceServers;
+                if (!context.mounted || !dialogOpen) return;
+                await showDialog<void>(
+                  context: context,
+                  barrierDismissible: false,
+                  builder: (callContext) => DirectVideoCallDialog(
+                    callId: callId,
+                    clientSide: false,
+                    iceServers: iceServers,
+                    sendSignal: (type, {sdp, candidate}) async {
+                      _controller.sendAdminVideoCallSignal(
+                        clientId: clientId,
+                        callId: callId,
+                        type: type,
+                        sdp: sdp,
+                        candidate: candidate,
+                      );
+                    },
+                    pollSignals: () async =>
+                        _controller.takeAdminVideoCallEvents(clientId),
+                    onClose: () => Navigator.of(callContext).pop(),
+                  ),
+                );
+              } catch (error) {
+                if (dialogOpen) {
+                  setDialogState(() => _error = '发起视频通话失败：$error');
                 }
               }
             }
@@ -4015,8 +4649,9 @@ class _InviteHostAppState extends State<InviteHostApp> {
                       tooltip: selectedMessageIds.isEmpty
                           ? '请选择消息'
                           : '删除 ${selectedMessageIds.length} 条消息',
-                      onPressed:
-                          selectedMessageIds.isEmpty ? null : deleteSelected,
+                      onPressed: selectedMessageIds.isEmpty
+                          ? null
+                          : deleteSelected,
                       icon: const Icon(Icons.delete_outline),
                     ),
                   IconButton(
@@ -4025,9 +4660,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
                       selectionMode = !selectionMode;
                       selectedMessageIds.clear();
                     }),
-                    icon: Icon(
-                      selectionMode ? Icons.close : Icons.checklist,
-                    ),
+                    icon: Icon(selectionMode ? Icons.close : Icons.checklist),
                   ),
                   IconButton(
                     tooltip: '客户端管理',
@@ -4062,9 +4695,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
                                     ? Icons.remove_done
                                     : Icons.select_all,
                               ),
-                              label: Text(
-                                allMessagesSelected ? '取消全选' : '全选',
-                              ),
+                              label: Text(allMessagesSelected ? '取消全选' : '全选'),
                             ),
                             const SizedBox(width: 12),
                             Text('已选 ${selectedMessageIds.length} 条'),
@@ -4087,29 +4718,32 @@ class _InviteHostAppState extends State<InviteHostApp> {
                                   for (final message in messages.reversed)
                                     Row(
                                       children: [
-                                        if (selectionMode &&
-                                            message['pending'] != true)
+                                        if (selectionMode)
                                           Checkbox(
                                             value: selectedMessageIds.contains(
                                               message['id'].toString(),
                                             ),
                                             onChanged: (selected) =>
                                                 setDialogState(() {
-                                              final id =
-                                                  message['id'].toString();
+                                                  final id = message['id']
+                                                      .toString();
                                               if (selected == true) {
                                                 selectedMessageIds.add(id);
                                               } else {
-                                                selectedMessageIds.remove(id);
+                                                    selectedMessageIds.remove(
+                                                      id,
+                                                    );
                                               }
                                             }),
                                           ),
                                         Expanded(
                                             child: _messageBubble(
                                           message,
-                                          onRetry: message['delivery_state'] ==
+                                            onRetry:
+                                                message['delivery_state'] ==
                                                       'failed' &&
-                                                  message['file_path'] is String
+                                                    message['file_path']
+                                                        is String
                                               ? () => sendMedia(
                                                     message['file_name']
                                                         as String,
@@ -4124,16 +4758,19 @@ class _InviteHostAppState extends State<InviteHostApp> {
                                                     message,
                                                   )
                                               : null,
-                                          downloading:
-                                              downloadingMessageIds.contains(
+                                            downloading: downloadingMessageIds
+                                                .contains(
                                             message['id'].toString(),
                                           ),
-                                          downloadProgress: downloadProgress[
-                                              message['id'].toString()],
+                                            downloadProgress:
+                                                downloadProgress[message['id']
+                                                    .toString()],
                                           onCancelDownload: () {
-                                            final mediaId = message['media_id'];
+                                              final mediaId =
+                                                  message['media_id'];
                                             if (mediaId is String) {
-                                              DirectAttachmentDownloads.instance
+                                                DirectAttachmentDownloads
+                                                    .instance
                                                   .cancel(
                                                 'host:$clientId:$mediaId',
                                               );
@@ -4144,7 +4781,8 @@ class _InviteHostAppState extends State<InviteHostApp> {
                                             message,
                                             setDialogState,
                                           ),
-                                        )),
+                                          ),
+                                        ),
                                       ],
                                     ),
                                 ],
@@ -4202,6 +4840,13 @@ class _InviteHostAppState extends State<InviteHostApp> {
                         alignment: WrapAlignment.center,
                         children: [
                           IconButton(
+                            tooltip: '呼叫客户端视频',
+                            onPressed: isRevoked
+                                ? null
+                                : () => startVideoCall(),
+                            icon: const Icon(Icons.video_call),
+                          ),
+                          IconButton(
                             tooltip: '发送震动提醒',
                             onPressed: isRevoked ? null : sendVibrationAlert,
                             icon: const Icon(Icons.vibration),
@@ -4232,8 +4877,8 @@ class _InviteHostAppState extends State<InviteHostApp> {
                                 ? null
                                 : () async {
                                     try {
-                                      final result =
-                                          await FilePicker.platform.pickFiles(
+                                      final result = await FilePicker.platform
+                                          .pickFiles(
                                         type: FileType.image,
                                         allowMultiple: false,
                                         withData: true,
@@ -4250,8 +4895,9 @@ class _InviteHostAppState extends State<InviteHostApp> {
                                         );
                                         return;
                                       }
-                                      final mimeType =
-                                          directMimeTypeForFile(file.name);
+                                      final mimeType = directMimeTypeForFile(
+                                        file.name,
+                                      );
                                       if (bytes.length > 1024 * 1024 ||
                                           !const {
                                             'image/jpeg',
@@ -4259,8 +4905,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
                                             'image/webp',
                                           }.contains(mimeType)) {
                                         setDialogState(
-                                          () => mediaError =
-                                              '头像仅支持不超过 1 MB 的 JPG、PNG 或 WebP 图片。',
+                                          () => mediaError = '头像仅支持不超过 1 MB 的 JPG、PNG 或 WebP 图片。',
                                         );
                                         return;
                                       }
@@ -4319,9 +4964,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
                                       }
                                     } catch (error) {
                                       if (dialogContext.mounted) {
-                                        setDialogState(
-                                          () => recording = false,
-                                        );
+                                        setDialogState(() => recording = false);
                                       }
                                       if (mounted) {
                                         setState(
@@ -4371,7 +5014,9 @@ class _InviteHostAppState extends State<InviteHostApp> {
       ...message,
       if (media != null) 'media_size': media['size'],
       if (_controller.localMediaPathForMessage(
-              message['client_id'] as String, message['id'].toString()) !=
+            message['client_id'] as String,
+            message['id'].toString(),
+          ) !=
           null)
         'media_path': _controller.localMediaPathForMessage(
           message['client_id'] as String,
@@ -4385,22 +5030,25 @@ class _InviteHostAppState extends State<InviteHostApp> {
           message: displayMessage,
           outgoing: message['sender'] == 'server',
           avatarData: message['sender'] == 'server'
-              ? _controller
-                  .serverAvatarForClient(message['client_id'] as String)
+          ? _controller.serverAvatarForClient(message['client_id'] as String)
               : _controller.avatarForClient(message['client_id'] as String),
           onRetry: onRetry,
           downloading: downloading || activeProgress != null,
           onCancelDownload: onCancelDownload,
           downloadProgress: downloadProgress ?? activeProgress,
-          onOpenAttachment: onOpenAttachment ??
+      onOpenAttachment:
+          onOpenAttachment ??
               () async {
                 try {
                   if (displayMessage['media_path'] is! String &&
                       displayMessage['media_id'] is String) {
-                    displayMessage['media_path'] =
-                        await _controller.downloadMediaToFile(displayMessage);
+                displayMessage['media_path'] = await _controller
+                    .downloadMediaToFile(displayMessage);
                   }
-                  final error = await openDirectAttachment(displayMessage);
+              final error = await openDirectAttachment(
+                displayMessage,
+                context: context,
+              );
                   if (error != null && mounted) {
                     ScaffoldMessenger.of(context)
                         .showSnackBar(SnackBar(content: Text(error)));
@@ -4433,8 +5081,9 @@ class _InviteHostAppState extends State<InviteHostApp> {
   }) {
     final screenSize = MediaQuery.of(context).size;
     final availableWidth = screenSize.width - (Platform.isWindows ? 96 : 32);
-    final availableHeight =
-        (screenSize.height - 240).clamp(120.0, height).toDouble();
+    final availableHeight = (screenSize.height - 240)
+        .clamp(120.0, height)
+        .toDouble();
     return Size(
       width < availableWidth ? width : availableWidth,
       height < availableHeight ? height : availableHeight,
@@ -4492,9 +5141,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
                     if (_isAddingInviteCodes) ...[
                       const Align(
                         alignment: Alignment.centerLeft,
-                        child: Text(
-                          '每行输入一个 8 到 256 位邀请码。每个口令只允许绑定一个客户端。',
-                        ),
+                        child: Text('每行输入一个 8 到 256 位邀请码。每个口令只允许绑定一个客户端。'),
                       ),
                       TextField(
                         controller: _inviteCodesInput,
@@ -4603,17 +5250,14 @@ class _InviteHostAppState extends State<InviteHostApp> {
     );
   }
 
-  Future<void> _showClientManagementDialog(BuildContext context) =>
-      showDialog<void>(
+  Future<void> _showClientManagementDialog(
+    BuildContext context,
+  ) => showDialog<void>(
         context: context,
         builder: (dialogContext) => AnimatedBuilder(
           animation: _controller,
           builder: (context, _) {
-            final dialogSize = _dialogContentSize(
-              context,
-              width: 760,
-              height: 620,
-            );
+        final dialogSize = _dialogContentSize(context, width: 760, height: 620);
             return AlertDialog(
               scrollable: true,
               title: const Text('客户端管理'),
@@ -4622,10 +5266,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
                 height: dialogSize.height,
                 child: ListView(
                   children: [
-                    Text(
-                      '已注册客户端',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
+                Text('已注册客户端', style: Theme.of(context).textTheme.titleMedium),
                     if (_controller.registeredClients.isEmpty)
                       const ListTile(title: Text('尚无已通过验证的客户端。'))
                     else
@@ -4636,9 +5277,11 @@ class _InviteHostAppState extends State<InviteHostApp> {
                               client['revoked'] == true
                                   ? Icons.block
                                   : DateTime.now()
-                                              .difference(DateTime.parse(
+                                        .difference(
+                                          DateTime.parse(
                                                 client['last_seen'].toString(),
-                                              ))
+                                          ),
+                                        )
                                               .inSeconds <
                                           30
                                       ? Icons.circle
@@ -4650,8 +5293,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
                             title: Text(
                               (client['remark'] as String? ?? '').isNotEmpty
                                   ? client['remark'].toString()
-                                  : (client['client_name'] ??
-                                          client['device_name'])
+                              : (client['client_name'] ?? client['device_name'])
                                       .toString(),
                             ),
                             subtitle: Text(
@@ -4763,8 +5405,9 @@ class _InviteHostAppState extends State<InviteHostApp> {
                             children: [
                               for (final client in clients)
                                 ListTile(
-                                  leading:
-                                      const Icon(Icons.chat_bubble_outline),
+                                  leading: const Icon(
+                                    Icons.chat_bubble_outline,
+                                  ),
                                   title: Text(
                                     (client['remark'] as String? ?? '')
                                             .isNotEmpty
@@ -4844,9 +5487,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
                                 () => _saveAdminCode(value.trim()),
                               );
                             },
-                            decoration: const InputDecoration(
-                              labelText: '管理员连接口令',
-                            ),
+                        decoration: const InputDecoration(labelText: '管理员连接口令'),
                           ),
                           const SizedBox(height: 8),
                           TextField(
@@ -4878,8 +5519,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
                                   ? null
                                   : () => Clipboard.setData(
                                         ClipboardData(
-                                          text:
-                                              _controller.adminCodeForDisplay!,
+                                    text: _controller.adminCodeForDisplay!,
                                         ),
                                       ),
                               icon: const Icon(Icons.copy),
@@ -4895,9 +5535,7 @@ class _InviteHostAppState extends State<InviteHostApp> {
                         FilledButton.icon(
                           onPressed: _busy ? null : _toggleServer,
                           icon: Icon(
-                            _controller.isRunning
-                                ? Icons.stop
-                                : Icons.play_arrow,
+                        _controller.isRunning ? Icons.stop : Icons.play_arrow,
                           ),
                           label: Text(
                             _busy
@@ -4914,24 +5552,26 @@ class _InviteHostAppState extends State<InviteHostApp> {
                             runSpacing: 12,
                             children: [
                               OutlinedButton.icon(
-                                onPressed: () =>
-                                    _showInviteCodesDialog(context),
+                            onPressed: () => _showInviteCodesDialog(context),
                                 icon: const Icon(Icons.vpn_key_outlined),
                                 label: const Text('邀请码管理'),
                               ),
                               OutlinedButton.icon(
                                 onPressed: () =>
                                     _showClientManagementDialog(context),
-                                icon:
-                                    const Icon(Icons.manage_accounts_outlined),
+                            icon: const Icon(Icons.manage_accounts_outlined),
                                 label: const Text('客户端管理'),
                               ),
                               OutlinedButton.icon(
-                                onPressed: () =>
-                                    _showClientChatsDialog(context),
+                            onPressed: () => _showClientChatsDialog(context),
                                 icon: const Icon(Icons.chat_bubble_outline),
                                 label: const Text('客户端聊天'),
                               ),
+                          OutlinedButton.icon(
+                            onPressed: () => _showVideoCallIceSettings(context),
+                            icon: const Icon(Icons.settings_voice),
+                            label: const Text('视频通话网络设置'),
+                          ),
                             ],
                           ),
                           const SizedBox(height: 16),

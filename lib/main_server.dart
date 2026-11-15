@@ -46,7 +46,12 @@ Future<void> main() async {
   }
   runApp(
     Platform.isWindows
-        ? InviteHostApp(cache: cache)
+        ? InviteHostApp(
+            cache: cache,
+            autoStartServer: Platform.executableArguments.contains(
+              '--start-server',
+            ),
+          )
         : RemoteAdminApp(cache: cache),
   );
 }

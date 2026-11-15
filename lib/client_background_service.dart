@@ -59,7 +59,7 @@ Future<void> initializeClientBackgroundService() async {
     androidConfiguration: AndroidConfiguration(
       onStart: clientBackgroundOnStart,
       autoStart: false,
-      autoStartOnBoot: true,
+      autoStartOnBoot: false,
       isForegroundMode: true,
       notificationChannelId: _serviceChannelId,
       foregroundServiceNotificationId: _serviceNotificationId,
@@ -106,7 +106,17 @@ Future<void> startClientBackgroundService({
 
 Future<void> stopClientBackgroundService() async {
   if (!Platform.isAndroid) return;
-  FlutterBackgroundService().invoke('stop');
+  final service = FlutterBackgroundService();
+  if (await service.isRunning()) {
+    service.invoke('stop');
+    for (var attempt = 0; attempt < 20; attempt++) {
+      if (!await service.isRunning()) break;
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    if (await service.isRunning()) {
+      throw StateError('The client background service did not stop.');
+    }
+  }
   await _secureStorage.delete(key: _sessionStorageKey);
   await _secureStorage.delete(key: _lastAlertStorageKey);
   AppLogger.log('client.background_service_stopped');

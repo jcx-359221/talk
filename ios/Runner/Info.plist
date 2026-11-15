@@ -28,8 +28,10 @@
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>连接你配置的聊天服务器，以发送和接收消息。</string>
+	<key>NSCameraUsageDescription</key>
+	<string>客户端视频通话需要使用摄像头。</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>录制语音消息并发送给聊天对象。</string>
+	<string>录制语音消息并在视频通话中传输声音。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>选择照片或视频并发送给聊天对象。</string>
 	<key>UIApplicationSceneManifest</key>

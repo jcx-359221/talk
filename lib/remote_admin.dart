@@ -13,6 +13,7 @@ import 'app_config.dart';
 import 'direct_chat.dart';
 import 'server_tls.dart';
 import 'secure_cache.dart';
+import 'video_call.dart';
 
 const _uuid = Uuid();
 const _pendingAdminUploadsKey = 'remote-admin-pending-uploads';
@@ -48,8 +49,10 @@ int compareRemoteAdminRecords(
     case RemoteAdminSortField.recentChat:
       if (DateTime.tryParse(left['last_chat_at']?.toString() ?? '') == null ||
           DateTime.tryParse(right['last_chat_at']?.toString() ?? '') == null) {
-        result =
-            _compareRecordDates(left['last_chat_at'], right['last_chat_at']);
+        result = _compareRecordDates(
+          left['last_chat_at'],
+          right['last_chat_at'],
+        );
         return result == 0 ? _compareRecordIdentity(left, right) : result;
       }
       result = _compareRecordDates(left['last_chat_at'], right['last_chat_at']);
@@ -85,13 +88,11 @@ int compareRemoteAdminRecords(
 int _compareRecordIdentity(
   Map<String, dynamic> left,
   Map<String, dynamic> right,
-) =>
-    (left['code'] ?? left['invite_code'] ?? left['client_id'])
-        .toString()
-        .compareTo(
-          (right['code'] ?? right['invite_code'] ?? right['client_id'])
-              .toString(),
-        );
+) => (left['code'] ?? left['invite_code'] ?? left['client_id'])
+    .toString()
+    .compareTo(
+      (right['code'] ?? right['invite_code'] ?? right['client_id']).toString(),
+    );
 
 String _recordName(Map<String, dynamic> record) =>
     record['client_name']?.toString() ??
@@ -107,11 +108,7 @@ int _compareRecordDates(Object? left, Object? right) {
   return leftDate.compareTo(rightDate);
 }
 
-int _compareRecordText(
-  String left,
-  String right, {
-  required bool initialOnly,
-}) {
+int _compareRecordText(String left, String right, {required bool initialOnly}) {
   final leftValue = _recordSortText(left, initialOnly: initialOnly);
   final rightValue = _recordSortText(right, initialOnly: initialOnly);
   final initialOrder = leftValue.compareTo(rightValue);
@@ -143,35 +140,100 @@ class RemoteManagementApi {
 
   Future<Map<String, dynamic>> state() => _request('GET', '/admin/state');
 
-  Future<List<Map<String, dynamic>>> messages(
+  Future<Map<String, dynamic>> startVideoCall(String clientId) => _request(
+    'POST',
+    '/admin/video-call/start',
+    body: {'client_id': clientId},
+  );
+
+  Future<List<Map<String, dynamic>>> pollVideoCallSignals(
     String clientId,
   ) async {
+    final response = await _request(
+      'GET',
+      '/admin/video-call/signals?client_id=${Uri.encodeQueryComponent(clientId)}',
+    );
+    final signals = response['signals'];
+    if (signals is! List) {
+      throw const FormatException('服务器返回了无效通话信令。');
+    }
+    return signals.whereType<Map>().map(Map<String, dynamic>.from).toList();
+  }
+
+  Future<void> sendVideoCallSignal({
+    required String clientId,
+    required String callId,
+    required String type,
+    String? sdp,
+    Map<String, dynamic>? candidate,
+  }) async {
+    await _request(
+      'POST',
+      '/admin/video-call/signal',
+      body: {
+        'client_id': clientId,
+        'call_id': callId,
+        'type': type,
+        if (sdp != null) 'sdp': sdp,
+        if (candidate != null) 'candidate': candidate,
+      },
+    );
+  }
+
+  Future<Map<String, dynamic>> videoCallIceServers() =>
+      _request('GET', '/admin/video-call/ice-servers');
+
+  Future<void> saveVideoCallIceServers({
+    required String stunUrl,
+    required String turnUrl,
+    required String turnUsername,
+    required String turnPassword,
+  }) async {
+    await _request(
+      'POST',
+      '/admin/video-call/ice-servers',
+      body: {
+        'stun_url': stunUrl,
+        'turn_url': turnUrl,
+        'turn_username': turnUsername,
+        'turn_password': turnPassword,
+      },
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> messages(String clientId) async {
     final result = await _request(
       'GET',
       '/admin/messages?client_id=${Uri.encodeQueryComponent(clientId)}',
     );
     final items = result['messages'];
     if (items is! List) throw const FormatException('服务器返回了无效会话。');
-    final messages =
-        items.whereType<Map>().map(Map<String, dynamic>.from).toList();
+    final messages = items
+        .whereType<Map>()
+        .map(Map<String, dynamic>.from)
+        .toList();
     return messages..sort(compareDirectMessages);
   }
 
   Future<Map<String, dynamic>> clientAvatars(String clientId) => _request(
-        'GET',
-        '/admin/client-avatar?client_id=${Uri.encodeQueryComponent(clientId)}',
-      );
+    'GET',
+    '/admin/client-avatar?client_id=${Uri.encodeQueryComponent(clientId)}',
+  );
 
   Future<void> uploadServerAvatar({
     required String clientId,
     required String data,
     required String mimeType,
   }) async {
-    await _request('POST', '/admin/client-avatar', body: {
-      'client_id': clientId,
-      'avatar_data': data,
-      'avatar_mime_type': mimeType,
-    });
+    await _request(
+      'POST',
+      '/admin/client-avatar',
+      body: {
+        'client_id': clientId,
+        'avatar_data': data,
+        'avatar_mime_type': mimeType,
+      },
+    );
   }
 
   Future<void> sendText(
@@ -179,30 +241,35 @@ class RemoteManagementApi {
     String text, {
     required String messageId,
   }) async {
-    await _request('POST', '/admin/message', body: {
-      'client_id': clientId,
-      'id': messageId,
-      'body': text,
-    });
+    await _request(
+      'POST',
+      '/admin/message',
+      body: {'client_id': clientId, 'id': messageId, 'body': text},
+    );
   }
 
   Future<void> deleteMessages(
     String clientId,
     Iterable<String> messageIds,
   ) async {
-    await _request('POST', '/admin/delete-messages', body: {
-      'client_id': clientId,
-      'message_ids': messageIds.toList(),
-    });
+    await _request(
+      'POST',
+      '/admin/delete-messages',
+      body: {'client_id': clientId, 'message_ids': messageIds.toList()},
+    );
   }
 
   Future<void> sendVibrationAlert(String clientId) async {
-    await _request('POST', '/admin/message', body: {
-      'client_id': clientId,
-      'id': _uuid.v4(),
-      'type': 'vibration_alert',
-      'body': '',
-    });
+    await _request(
+      'POST',
+      '/admin/message',
+      body: {
+        'client_id': clientId,
+        'id': _uuid.v4(),
+        'type': 'vibration_alert',
+        'body': '',
+      },
+    );
   }
 
   Future<void> sendMedia({
@@ -211,14 +278,18 @@ class RemoteManagementApi {
     required String mimeType,
     required List<int> bytes,
   }) async {
-    await _request('POST', '/admin/message', body: {
-      'client_id': clientId,
-      'id': _uuid.v4(),
-      'file_name': fileName,
-      'mime_type': mimeType,
-      'data': base64Encode(bytes),
-      'body': '',
-    });
+    await _request(
+      'POST',
+      '/admin/message',
+      body: {
+        'client_id': clientId,
+        'id': _uuid.v4(),
+        'file_name': fileName,
+        'mime_type': mimeType,
+        'data': base64Encode(bytes),
+        'body': '',
+      },
+    );
   }
 
   Future<void> sendMediaFile({
@@ -233,16 +304,16 @@ class RemoteManagementApi {
     String? previewData,
   }) {
     Future<void> upload() => _sendMediaFile(
-          clientId: clientId,
-          messageId: messageId,
-          fileName: fileName,
-          mimeType: mimeType,
-          filePath: filePath,
-          fileSize: fileSize,
-          onProgress: onProgress,
-          isCancelled: isCancelled,
-          previewData: previewData,
-        );
+      clientId: clientId,
+      messageId: messageId,
+      fileName: fileName,
+      mimeType: mimeType,
+      filePath: filePath,
+      fileSize: fileSize,
+      onProgress: onProgress,
+      isCancelled: isCancelled,
+      previewData: previewData,
+    );
     return mimeType.startsWith('video/')
         ? DirectVideoUploads.instance.enqueue(upload)
         : upload();
@@ -260,14 +331,18 @@ class RemoteManagementApi {
     String? previewData,
   }) async {
     if (fileSize <= 0) throw const FileSystemException('File is empty.');
-    final start = await _request('POST', '/admin/media/start', body: {
-      'client_id': clientId,
-      'id': messageId,
-      'file_name': fileName,
-      'mime_type': mimeType,
-      'size': fileSize,
-      if (previewData != null) 'preview_data': previewData,
-    });
+    final start = await _request(
+      'POST',
+      '/admin/media/start',
+      body: {
+        'client_id': clientId,
+        'id': messageId,
+        'file_name': fileName,
+        'mime_type': mimeType,
+        'size': fileSize,
+        if (previewData != null) 'preview_data': previewData,
+      },
+    );
     if (start['already_sent'] == true) {
       onProgress?.call(100);
       return;
@@ -295,10 +370,9 @@ class RemoteManagementApi {
       while (offset < fileSize) {
         throwIfCancelled();
         final end = (offset + chunkSize).clamp(0, fileSize);
-        final bytes = await file.openRead(offset, end).fold<List<int>>(
-          <int>[],
-          (all, next) => all..addAll(next),
-        );
+        final bytes = await file
+            .openRead(offset, end)
+            .fold<List<int>>(<int>[], (all, next) => all..addAll(next));
         await _request(
           'POST',
           '/admin/media/$uploadId/chunk/$index',
@@ -310,10 +384,11 @@ class RemoteManagementApi {
         onProgress?.call((offset * 98 ~/ fileSize).clamp(0, 98));
       }
       throwIfCancelled();
-      await _request('POST', '/admin/media/$uploadId/complete', body: {
-        'size': fileSize,
-        'chunk_count': index,
-      });
+      await _request(
+        'POST',
+        '/admin/media/$uploadId/complete',
+        body: {'size': fileSize, 'chunk_count': index},
+      );
       onProgress?.call(100);
     } catch (_) {
       try {
@@ -397,26 +472,19 @@ class RemoteManagementApi {
   }
 
   Future<void> setClientRemark(String clientId, String remark) async {
-    await _request('POST', '/admin/client-remark', body: {
-      'client_id': clientId,
-      'remark': remark,
-    });
+    await _request(
+      'POST',
+      '/admin/client-remark',
+      body: {'client_id': clientId, 'remark': remark},
+    );
   }
 
   Future<void> revokeInviteCode(String code) async {
-    await _request(
-      'POST',
-      '/admin/revoke-invite-code',
-      body: {'code': code},
-    );
+    await _request('POST', '/admin/revoke-invite-code', body: {'code': code});
   }
 
   Future<void> addInviteCodes(String codes) async {
-    await _request(
-      'POST',
-      '/admin/invite-codes',
-      body: {'codes': codes},
-    );
+    await _request('POST', '/admin/invite-codes', body: {'codes': codes});
   }
 
   Future<void> uploadLogs(String content) async {
@@ -431,10 +499,10 @@ class RemoteManagementApi {
     bool binaryResponse = false,
   }) async {
     final stopwatch = Stopwatch()..start();
-    AppLogger.log('http.request', details: {
-      'method': method,
-      'route': path.split('?').first,
-    });
+    AppLogger.log(
+      'http.request',
+      details: {'method': method, 'route': path.split('?').first},
+    );
     try {
       final request = await _client.openUrl(method, serverUri.resolve(path));
       request.headers.set('X-Admin-Code', adminCode);
@@ -444,28 +512,34 @@ class RemoteManagementApi {
         request.contentLength = utf8.encode(encodedBody).length;
         request.write(encodedBody);
       } else if (binaryBody != null) {
-        request.headers.contentType =
-            ContentType('application', 'octet-stream');
+        request.headers.contentType = ContentType(
+          'application',
+          'octet-stream',
+        );
         request.contentLength = binaryBody.length;
         request.add(binaryBody);
       }
-      final response =
-          await request.close().timeout(const Duration(seconds: 20));
+      final response = await request.close().timeout(
+        const Duration(seconds: 20),
+      );
       late final String text;
       if (binaryResponse) {
         final responseBytes = await response
-            .fold<List<int>>(<int>[], (all, next) => all..addAll(next)).timeout(
-                const Duration(seconds: 20));
+            .fold<List<int>>(<int>[], (all, next) => all..addAll(next))
+            .timeout(const Duration(seconds: 20));
         if (response.statusCode >= 200 &&
             response.statusCode < 300 &&
             response.headers.contentType?.mimeType ==
                 'application/octet-stream') {
-          AppLogger.log('http.response', details: {
-            'method': method,
-            'route': path.split('?').first,
-            'status': response.statusCode,
-            'duration_ms': stopwatch.elapsedMilliseconds,
-          });
+          AppLogger.log(
+            'http.response',
+            details: {
+              'method': method,
+              'route': path.split('?').first,
+              'status': response.statusCode,
+              'duration_ms': stopwatch.elapsedMilliseconds,
+            },
+          );
           return {'binary_data': responseBytes};
         }
         text = utf8.decode(responseBytes);
@@ -482,12 +556,15 @@ class RemoteManagementApi {
               : '服务器错误：${decoded['message'] ?? error}',
         );
       }
-      AppLogger.log('http.response', details: {
-        'method': method,
-        'route': path.split('?').first,
-        'status': response.statusCode,
-        'duration_ms': stopwatch.elapsedMilliseconds,
-      });
+      AppLogger.log(
+        'http.response',
+        details: {
+          'method': method,
+          'route': path.split('?').first,
+          'status': response.statusCode,
+          'duration_ms': stopwatch.elapsedMilliseconds,
+        },
+      );
       return Map<String, dynamic>.from(decoded);
     } catch (error, stackTrace) {
       AppLogger.log(
@@ -507,9 +584,14 @@ class _AdminUploadCancelled implements Exception {
 }
 
 Future<String?> _openRemoteAttachment(
-    RemoteManagementApi api, Map<String, dynamic> message,
-    {ValueChanged<int>? onProgress, bool Function()? shouldOpen}) async {
-  final savedMediaPath = message['media_path'] as String? ??
+  RemoteManagementApi api,
+  Map<String, dynamic> message, {
+  required BuildContext context,
+  ValueChanged<int>? onProgress,
+  bool Function()? shouldOpen,
+}) async {
+  final savedMediaPath =
+      message['media_path'] as String? ??
       (message['encrypted_local'] == true
           ? null
           : message['file_path'] as String?);
@@ -532,8 +614,9 @@ Future<String?> _openRemoteAttachment(
       await DirectAttachmentDownloads.instance.download(
         key: 'admin:$clientId:$mediaId',
         expectedSize: expectedSize,
-        sequential:
-            (message['mime_type'] as String? ?? '').startsWith('video/'),
+        sequential: (message['mime_type'] as String? ?? '').startsWith(
+          'video/',
+        ),
         onProgress: onProgress,
         download: (onProgress, managerCancelled) => api.downloadMediaToFile(
           mediaId: mediaId,
@@ -550,7 +633,7 @@ Future<String?> _openRemoteAttachment(
     message['media_path'] = path;
   }
   if (shouldOpen?.call() == false) return null;
-  return openDirectAttachment(message);
+  return openDirectAttachment(message, context: context);
 }
 
 class RemoteAdminApp extends StatefulWidget {
@@ -595,9 +678,7 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
   @override
   void initState() {
     super.initState();
-    _pendingAdminUploads.addAll(
-      widget.cache.mapList(_pendingAdminUploadsKey),
-    );
+    _pendingAdminUploads.addAll(widget.cache.mapList(_pendingAdminUploadsKey));
     final savedCode = widget.cache.text('remote-admin-code');
     _code.text = savedCode ?? '';
     if (savedCode != null && savedCode.isNotEmpty) {
@@ -624,8 +705,10 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
           .toList();
       return widget.cache.putMapList(_pendingAdminUploadsKey, snapshot);
     });
-    _pendingAdminWrite =
-        write.catchError((Object error, StackTrace stackTrace) {
+    _pendingAdminWrite = write.catchError((
+      Object error,
+      StackTrace stackTrace,
+    ) {
       AppLogger.log(
         'admin.pending_upload_cache_write_failed',
         level: 'error',
@@ -744,9 +827,8 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
       await api.uploadLogs(await AppLogger.readForUpload());
       AppLogger.log('logs.upload_succeeded');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('运行日志已上传到电脑服务器。')),
-        );
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('运行日志已上传到电脑服务器。')));
       }
     } catch (error, stackTrace) {
       AppLogger.log(
@@ -794,9 +876,7 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
       );
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('邀请码已更换，旧客户端的授权将被撤销；请把新码交给对应客户端。'),
-          ),
+          const SnackBar(content: Text('邀请码已更换，旧客户端的授权将被撤销；请把新码交给对应客户端。')),
         );
         await _refresh();
       }
@@ -867,9 +947,8 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                   if (dialogContext.mounted) Navigator.pop(dialogContext);
                 } catch (error) {
                   if (dialogContext.mounted) {
-                    ScaffoldMessenger.of(dialogContext).showSnackBar(
-                      SnackBar(content: Text('撤销失败：$error')),
-                    );
+                    ScaffoldMessenger.of(dialogContext)
+                        .showSnackBar(SnackBar(content: Text('撤销失败：$error')));
                   }
                 }
               },
@@ -976,21 +1055,21 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
             message['media_path'] = previous['media_path'];
           }
         }
-        final receivedIds =
-            latest.map((message) => message['id'].toString()).toSet();
+        final receivedIds = latest
+            .map((message) => message['id'].toString())
+            .toSet();
         final pendingCountBeforeRefresh = _pendingAdminUploads.length;
         _pendingAdminUploads.removeWhere((pending) {
-          final delivered = pending['client_id'] == clientId &&
+          final delivered =
+              pending['client_id'] == clientId &&
               receivedIds.contains(pending['id'].toString());
           return delivered;
         });
         if (_pendingAdminUploads.length != pendingCountBeforeRefresh) {
           _savePendingAdminUploads();
         }
-        final oldCombined = [
-          ...messages,
-          ...optimisticMessages,
-        ]..sort(compareDirectMessages);
+        final oldCombined = [...messages, ...optimisticMessages]
+          ..sort(compareDirectMessages);
         final pendingUploads = _pendingAdminUploads.where(
           (message) => message['client_id'] == clientId,
         );
@@ -1127,16 +1206,17 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
           _cancelledAdminUploadIds.remove(messageId);
         }
       });
-      _adminUploadQueue = queuedUpload.catchError(
-        (Object error, StackTrace stackTrace) {
-          AppLogger.log(
-            'admin.attachment_queue_failed',
-            level: 'error',
-            error: error,
-            stackTrace: stackTrace,
-          );
-        },
-      );
+      _adminUploadQueue = queuedUpload.catchError((
+        Object error,
+        StackTrace stackTrace,
+      ) {
+        AppLogger.log(
+          'admin.attachment_queue_failed',
+          level: 'error',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      });
     }
 
     Future<void> pickAndSend(
@@ -1245,10 +1325,10 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
       }
     }
 
-    void cancelAttachment(
+    Future<void> cancelAttachment(
       Map<String, dynamic> message,
       void Function(void Function()) update,
-    ) {
+    ) async {
       final messageId = message['id'].toString();
       _cancelledAdminUploadIds.add(messageId);
       optimisticMessages.removeWhere(
@@ -1256,22 +1336,86 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
       );
       _forgetPendingAdminUpload(messageId);
       final stagedPath = message['staged_file_path'];
-      if (stagedPath is String) {
-        unawaited(() async {
-          try {
-            final stagedFile = File(stagedPath);
-            if (await stagedFile.exists()) await stagedFile.delete();
-          } catch (error, stackTrace) {
-            AppLogger.log(
-              'admin.cancelled_attachment_cleanup_failed',
-              level: 'warning',
-              error: error,
-              stackTrace: stackTrace,
-            );
-          }
-        }());
+      if (stagedPath is String && !_activeAdminUploadIds.contains(messageId)) {
+        try {
+          final stagedFile = File(stagedPath);
+          if (await stagedFile.exists()) await stagedFile.delete();
+        } catch (error, stackTrace) {
+          AppLogger.log(
+            'admin.cancelled_attachment_cleanup_failed',
+            level: 'warning',
+            error: error,
+            stackTrace: stackTrace,
+          );
+        }
+      }
+      if (!_activeAdminUploadIds.contains(messageId)) {
+        _cancelledAdminUploadIds.remove(messageId);
       }
       if (dialogOpen) update(() {});
+    }
+
+    Future<void> deleteSelected(void Function(void Function()) update) async {
+      if (selectedMessageIds.isEmpty) return;
+      final confirmed = await showDialog<bool>(
+        context: _dialogContext,
+        builder: (context) => AlertDialog(
+          title: const Text('删除聊天记录'),
+          content: Text('确定永久删除选中的 ${selectedMessageIds.length} 条消息及其附件吗？'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('删除'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+      final deletingIds = selectedMessageIds.toSet();
+      final pendingMessages = <String, Map<String, dynamic>>{
+        for (final message in optimisticMessages)
+          if (deletingIds.contains(message['id'].toString()) &&
+              message['pending'] == true)
+            message['id'].toString(): message,
+        for (final message in _pendingAdminUploads)
+          if (message['client_id'] == clientId &&
+              deletingIds.contains(message['id'].toString()))
+            message['id'].toString(): message,
+      };
+      final persistedIds = messages
+          .where((message) => deletingIds.contains(message['id'].toString()))
+          .map((message) => message['id'].toString())
+          .toSet();
+      messageRevision++;
+      deletingMessages = true;
+      try {
+        if (persistedIds.isNotEmpty) {
+          await api.deleteMessages(clientId, persistedIds);
+        }
+        for (final message in pendingMessages.values) {
+          await cancelAttachment(message, update);
+        }
+        update(() {
+          messages.removeWhere(
+            (message) => deletingIds.contains(message['id'].toString()),
+          );
+          optimisticMessages.removeWhere(
+            (message) => deletingIds.contains(message['id'].toString()),
+          );
+          selectedMessageIds.clear();
+          selectionMode = false;
+          chatError = null;
+        });
+      } catch (error) {
+        update(() => chatError = '删除聊天记录失败：$error');
+      } finally {
+        deletingMessages = false;
+        unawaited(refresh(update));
+      }
     }
 
     Future<void> sendText(void Function(void Function()) update) async {
@@ -1314,12 +1458,57 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
       }
     }
 
+    Future<void> startVideoCall(void Function(void Function()) update) async {
+      final callContext = _dialogContext;
+      try {
+        final response = await api.startVideoCall(clientId);
+        final callId = response['call_id'];
+        final rawIceServers = response['ice_servers'];
+        if (callId is! String || rawIceServers is! List) {
+          throw const FormatException('服务器返回了无效视频通话配置。');
+        }
+        final iceServers = rawIceServers
+            .whereType<Map>()
+            .map(Map<String, dynamic>.from)
+            .toList();
+        if (!callContext.mounted) {
+          await api.sendVideoCallSignal(
+            clientId: clientId,
+            callId: callId,
+            type: 'hangup',
+          );
+          return;
+        }
+        await showDialog<void>(
+          context: callContext,
+          barrierDismissible: false,
+          builder: (callContext) => DirectVideoCallDialog(
+            callId: callId,
+            clientSide: false,
+            iceServers: iceServers,
+            sendSignal: (type, {sdp, candidate}) => api.sendVideoCallSignal(
+              clientId: clientId,
+              callId: callId,
+              type: type,
+              sdp: sdp,
+              candidate: candidate,
+            ),
+            pollSignals: () => api.pollVideoCallSignals(clientId),
+            onClose: () => Navigator.of(callContext).pop(),
+          ),
+        );
+      } catch (error) {
+        update(() => chatError = '发起视频通话失败：$error');
+      }
+    }
+
     Future<void> openAttachment(
       Map<String, dynamic> message,
       void Function(void Function()) update,
     ) async {
       final messageId = message['id'].toString();
-      final localPath = message['media_path'] as String? ??
+      final localPath =
+          message['media_path'] as String? ??
           (message['encrypted_local'] == true
               ? null
               : message['file_path'] as String?);
@@ -1328,7 +1517,10 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
         if (await localFile.exists() && await localFile.length() > 0) {
           message['media_path'] = localPath;
           try {
-            final error = await openDirectAttachment(message);
+            final error = await openDirectAttachment(
+              message,
+              context: _dialogContext,
+            );
             if (error != null && dialogOpen) {
               update(() => chatError = error);
             }
@@ -1341,15 +1533,19 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
       if (!downloadingMessageIds.add(messageId)) return;
       update(() => downloadProgress[messageId] = 0);
       try {
-        await _openRemoteAttachment(
+        final error = await _openRemoteAttachment(
           api,
           message,
+          context: _dialogContext,
           shouldOpen: () => dialogOpen,
           onProgress: (progress) {
             downloadProgress[messageId] = progress;
             if (dialogOpen) update(() {});
           },
         );
+        if (error != null && dialogOpen) {
+          update(() => chatError = error);
+        }
       } on DirectDownloadCancelled {
         // The user cancelled; the incomplete file has already been removed.
       } catch (error) {
@@ -1361,59 +1557,16 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
       }
     }
 
-    Future<void> deleteSelected(
-      void Function(void Function()) update,
-    ) async {
-      if (selectedMessageIds.isEmpty) return;
-      final confirmed = await showDialog<bool>(
-        context: _dialogContext,
-        builder: (context) => AlertDialog(
-          title: const Text('删除聊天记录'),
-          content: Text('确定永久删除选中的 ${selectedMessageIds.length} 条消息及其附件吗？'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('删除'),
-            ),
-          ],
-        ),
-      );
-      if (confirmed != true) return;
-      final deletingIds = selectedMessageIds.toSet();
-      messageRevision++;
-      deletingMessages = true;
-      try {
-        await api.deleteMessages(clientId, deletingIds);
-        update(() {
-          messages.removeWhere(
-            (message) => deletingIds.contains(message['id'].toString()),
-          );
-          optimisticMessages.removeWhere(
-            (message) => deletingIds.contains(message['id'].toString()),
-          );
-          selectedMessageIds.clear();
-          selectionMode = false;
-          chatError = null;
-        });
-      } catch (error) {
-        update(() => chatError = '删除聊天记录失败：$error');
-      } finally {
-        deletingMessages = false;
-        unawaited(refresh(update));
-      }
-    }
-
     try {
       messages = await api.messages(clientId);
-      final deliveredIds =
-          messages.map((message) => message['id'].toString()).toSet();
-      _pendingAdminUploads.removeWhere((pending) =>
-          pending['client_id'] == clientId &&
-          deliveredIds.contains(pending['id'].toString()));
+      final deliveredIds = messages
+          .map((message) => message['id'].toString())
+          .toSet();
+      _pendingAdminUploads.removeWhere(
+        (pending) =>
+            pending['client_id'] == clientId &&
+            deliveredIds.contains(pending['id'].toString()),
+      );
       for (final pending in _pendingAdminUploads.where(
         (message) => message['client_id'] == clientId,
       )) {
@@ -1454,9 +1607,12 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
               }
             }
             timer ??= Timer.periodic(
-                const Duration(seconds: 3), (_) => refresh(update));
-            avatarTimer ??=
-                Timer.periodic(const Duration(seconds: 30), (_) async {
+              const Duration(seconds: 3),
+              (_) => refresh(update),
+            );
+            avatarTimer ??= Timer.periodic(const Duration(seconds: 30), (
+              _,
+            ) async {
               try {
                 final latestAvatars = await api.clientAvatars(clientId);
                 if (!dialogOpen) return;
@@ -1562,23 +1718,20 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                               icon: Icon(
                                 selectionMode ? Icons.close : Icons.checklist,
                               ),
-                              label: Text(
-                                selectionMode ? '完成管理' : '管理聊天记录',
-                              ),
+                              label: Text(selectionMode ? '完成管理' : '管理聊天记录'),
                             ),
                             if (selectionMode) ...[
                               const SizedBox(width: 8),
                               OutlinedButton(
                                 onPressed: () => update(() {
                                   final selectableIds = visibleMessages
-                                      .where(
-                                        (message) => message['pending'] != true,
-                                      )
                                       .map(
-                                          (message) => message['id'].toString())
+                                        (message) => message['id'].toString(),
+                                      )
                                       .toSet();
-                                  if (selectedMessageIds
-                                      .containsAll(selectableIds)) {
+                                  if (selectedMessageIds.containsAll(
+                                    selectableIds,
+                                  )) {
                                     selectedMessageIds.clear();
                                   } else {
                                     selectedMessageIds
@@ -1588,13 +1741,12 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                                 }),
                                 child: Text(
                                   selectedMessageIds.isNotEmpty &&
-                                          visibleMessages
-                                              .where((message) =>
-                                                  message['pending'] != true)
-                                              .every((message) =>
-                                                  selectedMessageIds.contains(
-                                                    message['id'].toString(),
-                                                  ))
+                                          visibleMessages.every(
+                                            (message) =>
+                                                selectedMessageIds.contains(
+                                                  message['id'].toString(),
+                                                ),
+                                          )
                                       ? '取消全选'
                                       : '全选',
                                 ),
@@ -1615,8 +1767,9 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                       ),
                       if (chatError != null)
                         Align(
-                            alignment: Alignment.centerLeft,
-                            child: Text(chatError!)),
+                          alignment: Alignment.centerLeft,
+                          child: Text(chatError!),
+                        ),
                       Expanded(
                         child: visibleMessages.isEmpty
                             ? const Center(child: Text('还没有一小时内的消息'))
@@ -1628,15 +1781,14 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                                       in visibleMessages.reversed)
                                     Row(
                                       children: [
-                                        if (selectionMode &&
-                                            message['pending'] != true)
+                                        if (selectionMode)
                                           Checkbox(
                                             value: selectedMessageIds.contains(
                                               message['id'].toString(),
                                             ),
                                             onChanged: (selected) => update(() {
-                                              final id =
-                                                  message['id'].toString();
+                                              final id = message['id']
+                                                  .toString();
                                               if (selected == true) {
                                                 selectedMessageIds.add(id);
                                               } else {
@@ -1649,105 +1801,106 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                                             builder: (context) {
                                               final mediaId =
                                                   message['media_id'];
-                                              final downloadKey = mediaId
-                                                      is String
+                                              final downloadKey =
+                                                  mediaId is String
                                                   ? 'admin:${message['client_id']}:$mediaId'
                                                   : null;
                                               Widget buildBubble(
                                                 int? activeProgress,
-                                              ) =>
-                                                  DirectMessageBubble(
-                                                    key: ValueKey(
-                                                      message['id'].toString(),
+                                              ) => DirectMessageBubble(
+                                                key: ValueKey(
+                                                  message['id'].toString(),
+                                                ),
+                                                message: message,
+                                                outgoing:
+                                                    message['sender'] ==
+                                                    'server',
+                                                avatarData:
+                                                    message['sender'] ==
+                                                        'server'
+                                                    ? avatars['server_avatar_data']
+                                                          as String?
+                                                    : avatars['avatar_data']
+                                                          as String?,
+                                                onOpenAttachment: () =>
+                                                    openAttachment(
+                                                      message,
+                                                      update,
                                                     ),
-                                                    message: message,
-                                                    outgoing:
-                                                        message['sender'] ==
-                                                            'server',
-                                                    avatarData: message['sender'] ==
-                                                            'server'
-                                                        ? avatars[
-                                                                'server_avatar_data']
-                                                            as String?
-                                                        : avatars['avatar_data']
-                                                            as String?,
-                                                    onOpenAttachment: () =>
-                                                        openAttachment(
-                                                            message, update),
-                                                    downloading:
-                                                        downloadingMessageIds
-                                                                .contains(
-                                                              message['id']
-                                                                  .toString(),
-                                                            ) ||
-                                                            activeProgress !=
-                                                                null,
-                                                    downloadProgress:
-                                                        downloadProgress[message[
-                                                                    'id']
-                                                                .toString()] ??
-                                                            activeProgress,
-                                                    onCancelDownload: () {
-                                                      final clientId = message[
-                                                                  'client_id']
-                                                              ?.toString() ??
-                                                          'unknown';
-                                                      final mediaId =
-                                                          message['media_id'];
-                                                      if (mediaId is String) {
-                                                        DirectAttachmentDownloads
-                                                            .instance
-                                                            .cancel(
+                                                downloading:
+                                                    downloadingMessageIds
+                                                        .contains(
+                                                          message['id']
+                                                              .toString(),
+                                                        ) ||
+                                                    activeProgress != null,
+                                                downloadProgress:
+                                                    downloadProgress[message['id']
+                                                        .toString()] ??
+                                                    activeProgress,
+                                                onCancelDownload: () {
+                                                  final clientId =
+                                                      message['client_id']
+                                                          ?.toString() ??
+                                                      'unknown';
+                                                  final mediaId =
+                                                      message['media_id'];
+                                                  if (mediaId is String) {
+                                                    DirectAttachmentDownloads
+                                                        .instance
+                                                        .cancel(
                                                           'admin:$clientId:$mediaId',
                                                         );
+                                                  }
+                                                },
+                                                onRetry:
+                                                    message['delivery_state'] ==
+                                                            'failed' &&
+                                                        message['file_path']
+                                                            is String
+                                                    ? () {
+                                                        message
+                                                          ..['delivery_state'] =
+                                                              'queued'
+                                                          ..['upload_progress'] =
+                                                              0;
+                                                        _rememberPendingAdminUpload(
+                                                          message,
+                                                        );
+                                                        queueAttachment(
+                                                          message,
+                                                          update,
+                                                        );
                                                       }
-                                                    },
-                                                    onRetry:
-                                                        message['delivery_state'] ==
-                                                                    'failed' &&
-                                                                message['file_path']
-                                                                    is String
-                                                            ? () {
-                                                                message
-                                                                  ..['delivery_state'] =
-                                                                      'queued'
-                                                                  ..['upload_progress'] =
-                                                                      0;
-                                                                _rememberPendingAdminUpload(
-                                                                  message,
-                                                                );
-                                                                queueAttachment(
-                                                                  message,
-                                                                  update,
-                                                                );
-                                                              }
-                                                            : null,
-                                                    onCancel: message[
-                                                                    'pending'] ==
-                                                                true &&
-                                                            message['delivery_state'] !=
-                                                                'failed'
-                                                        ? () =>
-                                                            cancelAttachment(
-                                                              message,
-                                                              update,
-                                                            )
-                                                        : null,
-                                                  );
+                                                    : null,
+                                                onCancel:
+                                                    message['pending'] == true
+                                                    ? () => cancelAttachment(
+                                                        message,
+                                                        update,
+                                                      )
+                                                    : null,
+                                              );
                                               if (downloadKey == null) {
                                                 return buildBubble(null);
                                               }
                                               return ValueListenableBuilder<
-                                                  int?>(
+                                                int?
+                                              >(
                                                 valueListenable:
                                                     DirectAttachmentDownloads
                                                         .instance
                                                         .progressListenable(
-                                                  downloadKey,
-                                                ),
-                                                builder: (context,
-                                                        activeProgress, _) =>
-                                                    buildBubble(activeProgress),
+                                                          downloadKey,
+                                                        ),
+                                                builder:
+                                                    (
+                                                      context,
+                                                      activeProgress,
+                                                      _,
+                                                    ) => buildBubble(
+                                                      activeProgress,
+                                                    ),
                                               );
                                             },
                                           ),
@@ -1770,16 +1923,18 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                               textInputAction: TextInputAction.send,
                               onSubmitted: (_) => sendText(update),
                               scrollPhysics: const ClampingScrollPhysics(),
-                              decoration:
-                                  const InputDecoration(hintText: '输入回复'),
+                              decoration: const InputDecoration(
+                                hintText: '输入回复',
+                              ),
                             ),
                           ),
                           if (text.text.trim().isNotEmpty)
                             Padding(
                               padding: const EdgeInsets.only(left: 8),
                               child: FilledButton(
-                                onPressed:
-                                    isRevoked ? null : () => sendText(update),
+                                onPressed: isRevoked
+                                    ? null
+                                    : () => sendText(update),
                                 child: const Text('发送'),
                               ),
                             ),
@@ -1790,12 +1945,26 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                         child: Row(
                           children: [
                             IconButton(
+                              tooltip: '呼叫客户端视频',
+                              onPressed: isRevoked
+                                  ? null
+                                  : () => startVideoCall(update),
+                              constraints: const BoxConstraints.tightFor(
+                                width: 52,
+                                height: 52,
+                              ),
+                              padding: EdgeInsets.zero,
+                              icon: const Icon(Icons.video_call),
+                            ),
+                            IconButton(
                               tooltip: '发送震动提醒',
                               onPressed: isRevoked
                                   ? null
                                   : () => sendVibrationAlert(update),
                               constraints: const BoxConstraints.tightFor(
-                                  width: 52, height: 52),
+                                width: 52,
+                                height: 52,
+                              ),
                               padding: EdgeInsets.zero,
                               icon: const Icon(Icons.vibration),
                             ),
@@ -1805,7 +1974,9 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                                   ? null
                                   : () => pickAndSend(FileType.media, update),
                               constraints: const BoxConstraints.tightFor(
-                                  width: 52, height: 52),
+                                width: 52,
+                                height: 52,
+                              ),
                               padding: EdgeInsets.zero,
                               icon: const Icon(Icons.photo_library_outlined),
                             ),
@@ -1815,7 +1986,9 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                                   ? null
                                   : () => pickAndSend(FileType.any, update),
                               constraints: const BoxConstraints.tightFor(
-                                  width: 52, height: 52),
+                                width: 52,
+                                height: 52,
+                              ),
                               padding: EdgeInsets.zero,
                               icon: const Icon(Icons.attach_file),
                             ),
@@ -1863,10 +2036,13 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                                       }
                                     },
                               constraints: const BoxConstraints.tightFor(
-                                  width: 52, height: 52),
+                                width: 52,
+                                height: 52,
+                              ),
                               padding: EdgeInsets.zero,
                               icon: Icon(
-                                  recording ? Icons.stop_circle : Icons.mic),
+                                recording ? Icons.stop_circle : Icons.mic,
+                              ),
                             ),
                           ],
                         ),
@@ -1900,9 +2076,7 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
           maxLines: 5,
           autocorrect: false,
           enableSuggestions: false,
-          decoration: const InputDecoration(
-            hintText: '输入邀请码；每行一个，至少 8 位',
-          ),
+          decoration: const InputDecoration(hintText: '输入邀请码；每行一个，至少 8 位'),
         ),
         actions: [
           TextButton(
@@ -1922,9 +2096,8 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
       await _api!.addInviteCodes(codes);
       await _refresh();
       if (mounted) {
-        ScaffoldMessenger.of(_dialogContext).showSnackBar(
-          const SnackBar(content: Text('客户端邀请码已创建。')),
-        );
+        ScaffoldMessenger.of(_dialogContext)
+            .showSnackBar(const SnackBar(content: Text('客户端邀请码已创建。')));
       }
     } catch (error) {
       if (mounted) setState(() => _error = '创建邀请码失败：$error');
@@ -1981,15 +2154,14 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
     required RemoteAdminSortField sortField,
     required bool ascending,
   }) {
-    return records.toList()
-      ..sort(
-        (left, right) => compareRemoteAdminRecords(
-          left,
-          right,
-          sortField,
-          ascending: ascending,
-        ),
-      );
+    return records.toList()..sort(
+      (left, right) => compareRemoteAdminRecords(
+        left,
+        right,
+        sortField,
+        ascending: ascending,
+      ),
+    );
   }
 
   @override
@@ -2007,18 +2179,24 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
             children: [
               const Text('服务器地址已内置，只需输入管理员口令。'),
               TextField(
-                  controller: _code,
-                  obscureText: true,
-                  decoration: const InputDecoration(labelText: '管理员口令')),
+                controller: _code,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: '管理员口令'),
+              ),
               if (_error != null)
                 Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    child: Text(_error!,
-                        style: TextStyle(
-                            color: Theme.of(context).colorScheme.error))),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Text(
+                    _error!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ),
               FilledButton(
-                  onPressed: _busy ? null : _connect,
-                  child: Text(_busy ? '正在连接…' : '连接')),
+                onPressed: _busy ? null : _connect,
+                child: Text(_busy ? '正在连接…' : '连接'),
+              ),
             ],
           ),
         ),
@@ -2076,9 +2254,7 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
       theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
       home: Scaffold(
         appBar: AppBar(
-          title: Text(
-            _selectedPage == 0 ? '消息列表' : '邀请码管理',
-          ),
+          title: Text(_selectedPage == 0 ? '消息列表' : '邀请码管理'),
           actions: [
             IconButton(
               tooltip: '上传运行日志',
@@ -2086,15 +2262,16 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
               icon: const Icon(Icons.upload_file),
             ),
             IconButton(
-                tooltip: '断开连接',
-                onPressed: () {
-                  _timer?.cancel();
-                  setState(() {
-                    _api = null;
-                    _snapshot = null;
-                  });
-                },
-                icon: const Icon(Icons.logout)),
+              tooltip: '断开连接',
+              onPressed: () {
+                _timer?.cancel();
+                setState(() {
+                  _api = null;
+                  _snapshot = null;
+                });
+              },
+              icon: const Icon(Icons.logout),
+            ),
           ],
         ),
         body: RefreshIndicator(
@@ -2104,10 +2281,14 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
             children: [
               if (_error != null)
                 Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 8),
-                    child: Text(_error!,
-                        style: TextStyle(
-                            color: Theme.of(context).colorScheme.error))),
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Text(
+                    _error!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ),
               if (_selectedPage == 0) ...[
                 Text(
                   '客户端聊天（${filteredClients.length}）',
@@ -2138,19 +2319,28 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                     child: ListTile(
                       leading: Icon(
                         DateTime.now()
-                                    .difference(DateTime.tryParse(
-                                          client['last_seen'].toString(),
-                                        ) ??
-                                        DateTime.fromMillisecondsSinceEpoch(0))
+                                    .difference(
+                                      DateTime.tryParse(
+                                            client['last_seen'].toString(),
+                                          ) ??
+                                          DateTime.fromMillisecondsSinceEpoch(
+                                            0,
+                                          ),
+                                    )
                                     .inSeconds <
                                 30
                             ? Icons.circle
                             : Icons.phone_android,
-                        color: DateTime.now()
-                                    .difference(DateTime.tryParse(
-                                          client['last_seen'].toString(),
-                                        ) ??
-                                        DateTime.fromMillisecondsSinceEpoch(0))
+                        color:
+                            DateTime.now()
+                                    .difference(
+                                      DateTime.tryParse(
+                                            client['last_seen'].toString(),
+                                          ) ??
+                                          DateTime.fromMillisecondsSinceEpoch(
+                                            0,
+                                          ),
+                                    )
                                     .inSeconds <
                                 30
                             ? Colors.green
@@ -2210,8 +2400,8 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                       invite['status'] == '可用'
                           ? Icons.vpn_key
                           : invite['status'] == '已绑定'
-                              ? Icons.verified_user
-                              : Icons.key_off,
+                          ? Icons.verified_user
+                          : Icons.key_off,
                     ),
                     title: SelectableText(invite['code'].toString()),
                     subtitle: Text(
@@ -2222,9 +2412,7 @@ class _RemoteAdminAppState extends State<RemoteAdminApp> {
                       tooltip: '撤销邀请码',
                       onPressed: invite['status'] == '已失效'
                           ? null
-                          : () => _revokeInviteCode(
-                                invite['code'].toString(),
-                              ),
+                          : () => _revokeInviteCode(invite['code'].toString()),
                       icon: const Icon(Icons.block),
                     ),
                   ),

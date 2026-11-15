@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -10,8 +11,10 @@ import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:pdfrx/pdfrx.dart';
 import 'package:record/record.dart';
 import 'package:uuid/uuid.dart';
+import 'package:video_player/video_player.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
 import 'package:vibration/vibration.dart';
 
@@ -20,6 +23,7 @@ import 'client_background_service.dart';
 import 'message_crypto.dart';
 import 'server_tls.dart';
 import 'secure_cache.dart';
+import 'video_call.dart';
 
 const _uuid = Uuid();
 final _directVideoThumbnailCache = <String, Future<Uint8List?>>{};
@@ -55,16 +59,14 @@ Future<Directory> directCacheDirectory(
   List<String> segments = const [],
 }) async {
   final safeSegments = [category, ...segments].map(
-    (segment) => segment.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_').replaceAll(
-          RegExp(r'^\.{1,2}$'),
-          '_',
-        ),
+    (segment) => segment
+        .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_')
+        .replaceAll(RegExp(r'^\.{1,2}$'), '_'),
   );
   final base = await directCacheRoot();
-  final directory = Directory([
-    base.path,
-    ...safeSegments,
-  ].join(Platform.pathSeparator));
+  final directory = Directory(
+    [base.path, ...safeSegments].join(Platform.pathSeparator),
+  );
   await directory.create(recursive: true);
   return directory;
 }
@@ -142,23 +144,23 @@ class DirectAttachmentDownloads {
     if (onProgress != null) task.listeners.add(onProgress);
     _active[key] = task;
     progressListenable(key).value = task.progress;
-    Future<String> operation() => download(
-          (progress) {
-            task.progress = progress;
-            progressListenable(key).value = progress;
-            for (final listener in task.listeners.toList()) {
-              listener(progress);
-            }
-          },
-          () => task.cancelled,
-        ).then((path) {
-          _completedPaths[key] = path;
-          return path;
-        }).whenComplete(() {
-          if (identical(_active[key], task)) _active.remove(key);
-          progressListenable(key).value = null;
-          task.listeners.clear();
-        });
+    Future<String> operation() =>
+        download((progress) {
+              task.progress = progress;
+              progressListenable(key).value = progress;
+              for (final listener in task.listeners.toList()) {
+                listener(progress);
+              }
+            }, () => task.cancelled)
+            .then((path) {
+              _completedPaths[key] = path;
+              return path;
+            })
+            .whenComplete(() {
+              if (identical(_active[key], task)) _active.remove(key);
+              progressListenable(key).value = null;
+              task.listeners.clear();
+            });
     if (sequential) {
       final queued = _videoDownloadQueue.then((_) => operation());
       _videoDownloadQueue = queued.then<void>(
@@ -191,10 +193,7 @@ class DirectVideoUploads {
 
   Future<T> enqueue<T>(Future<T> Function() upload) {
     final queued = _queue.then((_) => upload());
-    _queue = queued.then<void>(
-      (_) {},
-      onError: (Object _, StackTrace __) {},
-    );
+    _queue = queued.then<void>((_) {}, onError: (Object _, StackTrace __) {});
     return queued;
   }
 }
@@ -246,12 +245,14 @@ Future<List<DirectPickedFile>> pickDirectMediaFiles() async {
     final selected = await ImagePicker().pickMultipleMedia();
     final files = <DirectPickedFile>[];
     for (final file in selected) {
-      files.add(DirectPickedFile(
-        name: file.name,
-        path: file.path,
-        size: await file.length(),
-        readStream: file.openRead(),
-      ));
+      files.add(
+        DirectPickedFile(
+          name: file.name,
+          path: file.path,
+          size: await file.length(),
+          readStream: file.openRead(),
+        ),
+      );
     }
     return files;
   }
@@ -300,12 +301,14 @@ Future<Uint8List?> _createVideoThumbnail(String filePath) {
   if (cached != null) return cached;
   final future = _generateVideoThumbnail(filePath);
   _directVideoThumbnailCache[filePath] = future;
-  unawaited(future.then((bytes) {
-    if (bytes == null &&
-        identical(_directVideoThumbnailCache[filePath], future)) {
-      _directVideoThumbnailCache.remove(filePath);
-    }
-  }));
+  unawaited(
+    future.then((bytes) {
+      if (bytes == null &&
+          identical(_directVideoThumbnailCache[filePath], future)) {
+        _directVideoThumbnailCache.remove(filePath);
+      }
+    }),
+  );
   return future;
 }
 
@@ -392,18 +395,17 @@ Add-Type -TypeDefinition $source -ReferencedAssemblies System.Drawing
   final process = await Process.start(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-STA', '-Command', script],
-    environment: {
-      ...Platform.environment,
-      'CONSENT_CHAT_VIDEO_PATH': filePath,
-    },
+    environment: {...Platform.environment, 'CONSENT_CHAT_VIDEO_PATH': filePath},
     runInShell: true,
   );
   final stdout = StringBuffer();
   final stderr = StringBuffer();
-  final stdoutSubscription =
-      process.stdout.transform(utf8.decoder).listen(stdout.write);
-  final stderrSubscription =
-      process.stderr.transform(utf8.decoder).listen(stderr.write);
+  final stdoutSubscription = process.stdout
+      .transform(utf8.decoder)
+      .listen(stdout.write);
+  final stderrSubscription = process.stderr
+      .transform(utf8.decoder)
+      .listen(stderr.write);
   try {
     final exitCode = await process.exitCode.timeout(
       const Duration(minutes: 2),
@@ -554,8 +556,9 @@ Future<int> prepareDirectPartialDownload({
     );
     return chunkCount;
   }
-  final resumeBytes =
-      length == expectedSize ? length : length - length % chunkSize;
+  final resumeBytes = length == expectedSize
+      ? length
+      : length - length % chunkSize;
   if (resumeBytes != length) {
     final handle = await partialFile.open(mode: FileMode.writeOnly);
     await handle.truncate(resumeBytes);
@@ -577,10 +580,7 @@ Future<void> finishDirectPartialDownload({
   await partialFile.rename(outputFile.path);
 }
 
-bool isDirectMessageVisible(
-  Map<String, dynamic> message, {
-  DateTime? now,
-}) {
+bool isDirectMessageVisible(Map<String, dynamic> message, {DateTime? now}) {
   final createdAt = DateTime.tryParse(message['created_at']?.toString() ?? '');
   if (createdAt == null) return false;
   final age = (now ?? DateTime.now()).toUtc().difference(createdAt.toUtc());
@@ -719,8 +719,8 @@ class DirectChatApi {
     this.serverUri, {
     required String messageCode,
     required this.certificateFingerprint,
-  })  : _messageCode = messageCode,
-        _httpClient = createPinnedHttpClient(certificateFingerprint);
+  }) : _messageCode = messageCode,
+       _httpClient = createPinnedHttpClient(certificateFingerprint);
 
   final Uri serverUri;
   final String certificateFingerprint;
@@ -792,6 +792,51 @@ class DirectChatApi {
       throw const FormatException('Invalid encrypted messages response.');
     }
     return decoded.whereType<Map>().map(Map<String, dynamic>.from).toList();
+  }
+
+  Future<List<Map<String, dynamic>>> pollVideoCallSignals({
+    required String clientId,
+    required String token,
+  }) async {
+    final response = await _request(
+      'GET',
+      '/video-call/signals',
+      clientId: clientId,
+      token: token,
+    );
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException('Server returned HTTP ${response.statusCode}.');
+    }
+    final signals = response.json['signals'];
+    if (signals is! List) {
+      throw const FormatException('Invalid video call signaling response.');
+    }
+    return signals.whereType<Map>().map(Map<String, dynamic>.from).toList();
+  }
+
+  Future<void> sendVideoCallSignal({
+    required String clientId,
+    required String token,
+    required String callId,
+    required String type,
+    String? sdp,
+    Map<String, dynamic>? candidate,
+  }) async {
+    final response = await _request(
+      'POST',
+      '/video-call/signal',
+      clientId: clientId,
+      token: token,
+      body: {
+        'call_id': callId,
+        'type': type,
+        if (sdp != null) 'sdp': sdp,
+        if (candidate != null) 'candidate': candidate,
+      },
+    );
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException('Server returned HTTP ${response.statusCode}.');
+    }
   }
 
   Future<void> deleteMessages({
@@ -866,10 +911,7 @@ class DirectChatApi {
       clientId: clientId,
       token: token,
       onProgress: onProgress,
-      body: {
-        'id': messageId,
-        'body': encryptedBody,
-      },
+      body: {'id': messageId, 'body': encryptedBody},
     );
     if (response.statusCode != HttpStatus.created) {
       throw HttpException('Server returned HTTP ${response.statusCode}.');
@@ -954,22 +996,22 @@ class DirectChatApi {
     bool Function()? isCancelled,
   }) {
     Future<Map<String, dynamic>> upload() => _sendMediaFile(
-          clientId: clientId,
-          token: token,
-          messageId: messageId,
-          fileName: fileName,
-          mimeType: mimeType,
-          filePath: filePath,
-          fileSize: fileSize,
-          encryptedChunks: encryptedChunks,
-          rawVideoChunks: rawVideoChunks,
-          sourceChunkCount: sourceChunkCount,
-          body: body,
-          previewData: previewData,
-          onUploadState: onUploadState,
-          onProgress: onProgress,
-          isCancelled: isCancelled,
-        );
+      clientId: clientId,
+      token: token,
+      messageId: messageId,
+      fileName: fileName,
+      mimeType: mimeType,
+      filePath: filePath,
+      fileSize: fileSize,
+      encryptedChunks: encryptedChunks,
+      rawVideoChunks: rawVideoChunks,
+      sourceChunkCount: sourceChunkCount,
+      body: body,
+      previewData: previewData,
+      onUploadState: onUploadState,
+      onProgress: onProgress,
+      isCancelled: isCancelled,
+    );
     return mimeType.startsWith('video/')
         ? DirectVideoUploads.instance.enqueue(upload)
         : upload();
@@ -1044,11 +1086,13 @@ class DirectChatApi {
         final actualSize = await file.length();
         if (actualSize != fileSize) {
           throw const FileSystemException(
-              'Selected file changed before upload.');
+            'Selected file changed before upload.',
+          );
         }
       } else if (sourceChunkCount == null || sourceChunkCount <= 0) {
         throw const FileSystemException(
-            'Encrypted attachment chunks are missing.');
+          'Encrypted attachment chunks are missing.',
+        );
       }
       var index = nextChunk;
       var offset = (nextChunk * chunkSize).clamp(0, fileSize);
@@ -1062,29 +1106,29 @@ class DirectChatApi {
         final end = (offset + chunkSize).clamp(0, fileSize);
         final bytes = encryptedChunks
             ? isVideo
-                ? base64Decode(await compute(_decryptDirectPayload, {
-                    'code': _messageCode,
-                    'ciphertext': await File(
-                      '$filePath${Platform.pathSeparator}$index.chunk',
-                    ).readAsString(),
-                  }))
-                : <int>[]
-            : await file.openRead(offset, end).fold<List<int>>(
-                <int>[],
-                (all, next) => all..addAll(next),
-              );
+                  ? base64Decode(
+                      await compute(_decryptDirectPayload, {
+                        'code': _messageCode,
+                        'ciphertext': await File(
+                          '$filePath${Platform.pathSeparator}$index.chunk',
+                        ).readAsString(),
+                      }),
+                    )
+                  : <int>[]
+            : await file
+                  .openRead(offset, end)
+                  .fold<List<int>>(<int>[], (all, next) => all..addAll(next));
         final encrypted = encryptedChunks
             ? isVideo
-                ? null
-                : await File(
-                    '$filePath${Platform.pathSeparator}$index.chunk',
-                  ).readAsString()
+                  ? null
+                  : await File('$filePath${Platform.pathSeparator}$index.chunk')
+                        .readAsString()
             : sendRawVideo
-                ? null
-                : await compute(_encryptDirectPayload, {
-                    'code': _messageCode,
-                    'plaintext': base64Encode(bytes),
-                  });
+            ? null
+            : await compute(_encryptDirectPayload, {
+                'code': _messageCode,
+                'plaintext': base64Encode(bytes),
+              });
         final response = await _request(
           'POST',
           '/media/$uploadId/chunk/$index',
@@ -1109,7 +1153,8 @@ class DirectChatApi {
       throwIfCancelled();
       if (encryptedChunks && index != sourceChunkCount) {
         throw const FileSystemException(
-            'Encrypted attachment chunks are incomplete.');
+          'Encrypted attachment chunks are incomplete.',
+        );
       }
       final completeCipher = await compute(_encryptDirectPayload, {
         'code': _messageCode,
@@ -1229,16 +1274,15 @@ class DirectChatApi {
     required String outputPath,
     ValueChanged<int>? onProgress,
     bool Function()? isCancelled,
-  }) =>
-      _decryptLocalMediaChunksToFile(
-        messageCode: _messageCode,
-        encryptedDirectory: encryptedDirectory,
-        chunkCount: chunkCount,
-        expectedSize: expectedSize,
-        outputPath: outputPath,
-        onProgress: onProgress,
-        isCancelled: isCancelled,
-      );
+  }) => _decryptLocalMediaChunksToFile(
+    messageCode: _messageCode,
+    encryptedDirectory: encryptedDirectory,
+    chunkCount: chunkCount,
+    expectedSize: expectedSize,
+    outputPath: outputPath,
+    onProgress: onProgress,
+    isCancelled: isCancelled,
+  );
 
   String _serverError(_ApiResponse response) =>
       response.json['message'] as String? ??
@@ -1263,10 +1307,12 @@ class DirectChatApi {
     if (contentCipher is! String) {
       throw const FormatException('Server returned invalid attachment data.');
     }
-    final decoded = jsonDecode(await compute(_decryptDirectPayload, {
-      'code': _messageCode,
-      'ciphertext': contentCipher,
-    }));
+    final decoded = jsonDecode(
+      await compute(_decryptDirectPayload, {
+        'code': _messageCode,
+        'ciphertext': contentCipher,
+      }),
+    );
     if (decoded is! Map ||
         decoded['file_name'] is! String ||
         decoded['mime_type'] is! String ||
@@ -1300,13 +1346,16 @@ class DirectChatApi {
     if (encrypted is! String) {
       throw const FormatException('Server returned an invalid message.');
     }
-    final decoded = jsonDecode(await compute(_decryptDirectPayload, {
-      'code': _messageCode,
-      'ciphertext': encrypted,
-    }));
+    final decoded = jsonDecode(
+      await compute(_decryptDirectPayload, {
+        'code': _messageCode,
+        'ciphertext': encrypted,
+      }),
+    );
     if (decoded is! Map) {
       throw const FormatException(
-          'Server returned an invalid encrypted message.');
+        'Server returned an invalid encrypted message.',
+      );
     }
     return Map<String, dynamic>.from(decoded);
   }
@@ -1323,13 +1372,14 @@ class DirectChatApi {
     ValueChanged<int>? onProgress,
     Duration timeout = const Duration(seconds: 20),
   }) async {
-    final requestUri =
-        path.startsWith('https://') ? Uri.parse(path) : serverUri.resolve(path);
+    final requestUri = path.startsWith('https://')
+        ? Uri.parse(path)
+        : serverUri.resolve(path);
     final stopwatch = Stopwatch()..start();
-    AppLogger.log('http.request', details: {
-      'method': method,
-      'route': requestUri.path,
-    });
+    AppLogger.log(
+      'http.request',
+      details: {'method': method, 'route': requestUri.path},
+    );
     try {
       final request = await _httpClient.openUrl(method, requestUri);
       if (clientId != null) {
@@ -1344,13 +1394,17 @@ class DirectChatApi {
           const chunkSize = 256 * 1024;
           var sentBytes = 0;
           var lastProgress = -1;
-          for (var offset = 0;
-              offset < encodedBody.length;
-              offset += chunkSize) {
+          for (
+            var offset = 0;
+            offset < encodedBody.length;
+            offset += chunkSize
+          ) {
             final end = (offset + chunkSize).clamp(0, encodedBody.length);
             sentBytes += end - offset;
-            final progress =
-                (sentBytes * 100 ~/ encodedBody.length).clamp(0, 100);
+            final progress = (sentBytes * 100 ~/ encodedBody.length).clamp(
+              0,
+              100,
+            );
             if (progress != lastProgress) {
               lastProgress = progress;
               onProgress?.call(progress);
@@ -1370,18 +1424,22 @@ class DirectChatApi {
       final response = await request.close().timeout(timeout);
       late final String text;
       if (allowBinaryResponse) {
-        final responseBytes = await response.fold<List<int>>(
-            <int>[], (all, next) => all..addAll(next)).timeout(timeout);
+        final responseBytes = await response
+            .fold<List<int>>(<int>[], (all, next) => all..addAll(next))
+            .timeout(timeout);
         if (response.statusCode >= 200 &&
             response.statusCode < 300 &&
             response.headers.contentType?.mimeType ==
                 'application/octet-stream') {
-          AppLogger.log('http.response', details: {
-            'method': method,
-            'route': requestUri.path,
-            'status': response.statusCode,
-            'duration_ms': stopwatch.elapsedMilliseconds,
-          });
+          AppLogger.log(
+            'http.response',
+            details: {
+              'method': method,
+              'route': requestUri.path,
+              'status': response.statusCode,
+              'duration_ms': stopwatch.elapsedMilliseconds,
+            },
+          );
           return _ApiResponse(
             response.statusCode,
             const {},
@@ -1401,12 +1459,15 @@ class DirectChatApi {
       if (decoded is! Map) {
         throw const FormatException('Server returned an invalid response.');
       }
-      AppLogger.log('http.response', details: {
-        'method': method,
-        'route': requestUri.path,
-        'status': response.statusCode,
-        'duration_ms': stopwatch.elapsedMilliseconds,
-      });
+      AppLogger.log(
+        'http.response',
+        details: {
+          'method': method,
+          'route': requestUri.path,
+          'status': response.statusCode,
+          'duration_ms': stopwatch.elapsedMilliseconds,
+        },
+      );
       return _ApiResponse(
         response.statusCode,
         Map<String, dynamic>.from(decoded),
@@ -1442,10 +1503,9 @@ Uint8List _encodeDirectMediaRequest(Map<String, Object?> arguments) {
     }),
   );
   return Uint8List.fromList(
-    utf8.encode(jsonEncode({
-      'id': arguments['id'],
-      'content_cipher': encrypted,
-    })),
+    utf8.encode(
+      jsonEncode({'id': arguments['id'], 'content_cipher': encrypted}),
+    ),
   );
 }
 
@@ -1471,13 +1531,77 @@ class _DirectUploadCancelled implements Exception {
   const _DirectUploadCancelled();
 }
 
-Future<String?> openDirectAttachment(Map<String, dynamic> message) async {
-  final mimeType = message['mime_type'] as String? ??
+class DirectAudioPlayback {
+  final _player = AudioPlayer();
+  final activeMessageId = ValueNotifier<String?>(null);
+  final isPlaying = ValueNotifier<bool>(false);
+
+  DirectAudioPlayback() {
+    _player.onPlayerStateChanged.listen((state) {
+      isPlaying.value = state == PlayerState.playing;
+      if (state == PlayerState.completed) activeMessageId.value = null;
+    });
+  }
+
+  Future<String?> toggle({
+    required String messageId,
+    required String path,
+  }) async {
+    try {
+      if (activeMessageId.value == messageId) {
+        if (isPlaying.value) {
+          await _player.pause();
+        } else {
+          await _player.resume();
+        }
+      } else {
+        await _player.stop();
+        activeMessageId.value = messageId;
+        await _player.play(DeviceFileSource(path));
+      }
+      return null;
+    } catch (error, stackTrace) {
+      AppLogger.log(
+        'client.audio_playback_failed',
+        level: 'error',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      activeMessageId.value = null;
+      return '无法播放语音：$error';
+    }
+  }
+}
+
+final directAudioPlayback = DirectAudioPlayback();
+
+Future<String?> openDirectAttachment(
+  Map<String, dynamic> message, {
+  BuildContext? context,
+}) async {
+  final mimeType =
+      message['mime_type'] as String? ??
       directMimeTypeForFile(message['file_name']?.toString() ?? '');
-  final savedPath = message['media_path'] ??
+  final isAudio = mimeType.startsWith('audio/');
+  final messageId = message['id'].toString();
+  final savedPath =
+      message['media_path'] ??
       message['source_file_path'] ??
       message['file_path'];
   if (savedPath is String && await File(savedPath).exists()) {
+    if (isAudio) {
+      return directAudioPlayback.toggle(messageId: messageId, path: savedPath);
+    }
+    if (context != null &&
+        context.mounted &&
+        await _showDirectAttachmentInApp(
+          context,
+          savedPath,
+          mimeType,
+          message['file_name']?.toString() ?? savedPath,
+        )) {
+      return null;
+    }
     final result = await OpenFilex.open(savedPath, type: mimeType);
     return result.type == ResultType.done
         ? null
@@ -1495,10 +1619,273 @@ Future<String?> openDirectAttachment(Map<String, dynamic> message) async {
   );
   final path = '${directory.path}${Platform.pathSeparator}$safeName';
   await File(path).writeAsBytes(base64Decode(encoded), flush: true);
+  if (isAudio) {
+    return directAudioPlayback.toggle(messageId: messageId, path: path);
+  }
+  if (context != null &&
+      context.mounted &&
+      await _showDirectAttachmentInApp(
+        context,
+        path,
+        mimeType,
+        message['file_name']?.toString() ?? safeName,
+      )) {
+    return null;
+  }
   final result = await OpenFilex.open(path, type: mimeType);
   return result.type == ResultType.done
       ? null
       : '没有可打开此附件的应用：${result.message}';
+}
+
+Future<bool> _showDirectAttachmentInApp(
+  BuildContext context,
+  String path,
+  String mimeType,
+  String fileName,
+) async {
+  final extension = fileName.split('.').last.toLowerCase();
+  if (mimeType.startsWith('image/') &&
+      const {'jpg', 'jpeg', 'png', 'gif', 'webp'}.contains(extension)) {
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => Dialog.fullscreen(
+        child: Scaffold(
+          appBar: AppBar(
+            title: Text(fileName, maxLines: 1, overflow: TextOverflow.ellipsis),
+            leading: IconButton(
+              icon: const Icon(Icons.close),
+              onPressed: () => Navigator.of(dialogContext).pop(),
+            ),
+          ),
+          body: Center(
+            child: InteractiveViewer(
+              minScale: 0.5,
+              maxScale: 8,
+              child: Image.file(File(path), fit: BoxFit.contain),
+            ),
+          ),
+        ),
+      ),
+    );
+    return true;
+  }
+  if (mimeType.startsWith('video/') &&
+      (Platform.isAndroid || Platform.isIOS) &&
+      const {'mp4', 'm4v', 'mov', '3gp'}.contains(extension)) {
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => Dialog.fullscreen(
+        child: _DirectVideoAttachmentViewer(
+          file: File(path),
+          fileName: fileName,
+          onClose: () => Navigator.of(dialogContext).pop(),
+        ),
+      ),
+    );
+    return true;
+  }
+  if (extension == 'pdf') {
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => Dialog.fullscreen(
+        child: Scaffold(
+          appBar: AppBar(
+            title: Text(fileName, maxLines: 1, overflow: TextOverflow.ellipsis),
+            leading: IconButton(
+              icon: const Icon(Icons.close),
+              onPressed: () => Navigator.of(dialogContext).pop(),
+            ),
+          ),
+          body: PdfViewer.file(path),
+        ),
+      ),
+    );
+    return true;
+  }
+  if (const {'txt', 'md', 'csv', 'log', 'json', 'xml'}.contains(extension)) {
+    final file = File(path);
+    if (await file.length() > 1024 * 1024) return false;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => Dialog.fullscreen(
+        child: Scaffold(
+          appBar: AppBar(
+            title: Text(fileName, maxLines: 1, overflow: TextOverflow.ellipsis),
+            leading: IconButton(
+              icon: const Icon(Icons.close),
+              onPressed: () => Navigator.of(dialogContext).pop(),
+            ),
+          ),
+          body: FutureBuilder<String>(
+            future: file.readAsString(),
+            builder: (context, snapshot) {
+              if (snapshot.hasError) {
+                return Center(child: Text('无法读取文件：${snapshot.error}'));
+              }
+              if (!snapshot.hasData) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              return SelectionArea(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    snapshot.data!,
+                    style: const TextStyle(fontFamily: 'monospace'),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    return true;
+  }
+  return false;
+}
+
+class _DirectVideoAttachmentViewer extends StatefulWidget {
+  const _DirectVideoAttachmentViewer({
+    required this.file,
+    required this.fileName,
+    required this.onClose,
+  });
+
+  final File file;
+  final String fileName;
+  final VoidCallback onClose;
+
+  @override
+  State<_DirectVideoAttachmentViewer> createState() =>
+      _DirectVideoAttachmentViewerState();
+}
+
+class _DirectVideoAttachmentViewerState
+    extends State<_DirectVideoAttachmentViewer> {
+  late final VideoPlayerController _controller;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = VideoPlayerController.file(widget.file);
+    _controller
+        .initialize()
+        .then((_) {
+          if (mounted) setState(() {});
+        })
+        .catchError((Object error, StackTrace stackTrace) {
+          AppLogger.log(
+            'attachment.video_initialize_failed',
+            level: 'error',
+            error: error,
+            stackTrace: stackTrace,
+          );
+          if (mounted) setState(() => _error = '无法播放此视频：$error');
+        });
+    _controller.addListener(_refresh);
+  }
+
+  void _refresh() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _controller.removeListener(_refresh);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  String _formatDuration(Duration duration) {
+    final minutes = duration.inMinutes;
+    final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final duration = _controller.value.duration;
+    final position = _controller.value.position;
+    final maxMilliseconds = duration.inMilliseconds > 0
+        ? duration.inMilliseconds
+        : 1;
+    final currentMilliseconds = position.inMilliseconds
+        .clamp(0, maxMilliseconds)
+        .toDouble();
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        title: Text(
+          widget.fileName,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        leading: IconButton(
+          icon: const Icon(Icons.close),
+          onPressed: widget.onClose,
+        ),
+      ),
+      body: Center(
+        child: _error != null
+            ? Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text(
+                  _error!,
+                  style: const TextStyle(color: Colors.white),
+                  textAlign: TextAlign.center,
+                ),
+              )
+            : !_controller.value.isInitialized
+            ? const CircularProgressIndicator()
+            : Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  AspectRatio(
+                    aspectRatio: _controller.value.aspectRatio,
+                    child: VideoPlayer(_controller),
+                  ),
+                  Row(
+                    children: [
+                      IconButton(
+                        color: Colors.white,
+                        icon: Icon(
+                          _controller.value.isPlaying
+                              ? Icons.pause
+                              : Icons.play_arrow,
+                        ),
+                        onPressed: () => _controller.value.isPlaying
+                            ? _controller.pause()
+                            : _controller.play(),
+                      ),
+                      Text(
+                        _formatDuration(position),
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                      Expanded(
+                        child: Slider(
+                          value: currentMilliseconds,
+                          max: maxMilliseconds.toDouble(),
+                          onChanged: (value) => _controller.seekTo(
+                            Duration(milliseconds: value.round()),
+                          ),
+                        ),
+                      ),
+                      Text(
+                        _formatDuration(duration),
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                      const SizedBox(width: 12),
+                    ],
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
 }
 
 String directMimeTypeForFile(String fileName) {
@@ -1523,6 +1910,21 @@ String directMimeTypeForFile(String fileName) {
     'wav' => 'audio/wav',
     'ogg' || 'opus' => 'audio/ogg',
     'amr' => 'audio/amr',
+    'pdf' => 'application/pdf',
+    'txt' => 'text/plain',
+    'md' => 'text/markdown',
+    'csv' => 'text/csv',
+    'log' => 'text/plain',
+    'json' => 'application/json',
+    'xml' => 'application/xml',
+    'doc' => 'application/msword',
+    'docx' =>
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'xls' => 'application/vnd.ms-excel',
+    'xlsx' =>
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'ppt' => 'application/vnd.ms-powerpoint',
+    'pptx' => 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     _ => 'application/octet-stream',
   };
 }
@@ -1575,9 +1977,10 @@ class _DirectChatClientAppState extends State<DirectChatClientApp> {
   }
 
   Future<void> _connect() async {
-    AppLogger.log('client.connect_started', details: {
-      'server': widget.api.serverUri.authority,
-    });
+    AppLogger.log(
+      'client.connect_started',
+      details: {'server': widget.api.serverUri.authority},
+    );
     try {
       final response = await widget.api.validate(
         code: widget.inviteCode,
@@ -1657,10 +2060,7 @@ class _DirectChatClientAppState extends State<DirectChatClientApp> {
   Future<void> _editClientName() async {
     final dialogContext = _navigatorKey.currentContext;
     if (dialogContext == null) {
-      AppLogger.log(
-        'client.name_editor_unavailable',
-        level: 'warning',
-      );
+      AppLogger.log('client.name_editor_unavailable', level: 'warning');
       return;
     }
     _clientNameController.text = _clientName;
@@ -1681,10 +2081,8 @@ class _DirectChatClientAppState extends State<DirectChatClientApp> {
             child: const Text('取消'),
           ),
           FilledButton(
-            onPressed: () => Navigator.pop(
-              context,
-              _clientNameController.text.trim(),
-            ),
+            onPressed: () =>
+                Navigator.pop(context, _clientNameController.text.trim()),
             child: const Text('保存'),
           ),
         ],
@@ -1709,8 +2107,10 @@ class _DirectChatClientAppState extends State<DirectChatClientApp> {
         throw const FormatException('服务器未返回有效的客户端授权。');
       }
       await widget.cache.putText('direct-client-name', name);
-      await widget.cache
-          .putText('direct-token:${widget.clientId}', updatedToken);
+      await widget.cache.putText(
+        'direct-token:${widget.clientId}',
+        updatedToken,
+      );
       if (!mounted) return;
       setState(() {
         _clientName = name;
@@ -1726,9 +2126,8 @@ class _DirectChatClientAppState extends State<DirectChatClientApp> {
       if (mounted) {
         final messengerContext = _navigatorKey.currentContext;
         if (messengerContext != null && messengerContext.mounted) {
-          ScaffoldMessenger.of(messengerContext).showSnackBar(
-            SnackBar(content: Text('名称修改失败：$error')),
-          );
+          ScaffoldMessenger.of(messengerContext)
+              .showSnackBar(SnackBar(content: Text('名称修改失败：$error')));
         }
       }
     }
@@ -1736,76 +2135,75 @@ class _DirectChatClientAppState extends State<DirectChatClientApp> {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-        navigatorKey: _navigatorKey,
-        title: 'Consent Chat',
-        theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
-        home: PopScope<Object?>(
-          canPop: false,
-          onPopInvokedWithResult: (didPop, _) {
-            if (!didPop) unawaited(_exitClient());
-          },
-          child: Scaffold(
-            appBar: AppBar(
-              automaticallyImplyLeading: false,
-              leading: IconButton(
-                tooltip: '修改名称',
-                onPressed: () => unawaited(_editClientName()),
-                icon: const Icon(Icons.edit_outlined),
-              ),
-              title: InkWell(
-                onTap: () => unawaited(_editClientName()),
-                child: Text(
-                  _clientName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 16),
-                ),
-              ),
-              actions: [
-                if (_token != null)
-                  TextButton.icon(
-                    onPressed: () =>
-                        _chatScreenKey.currentState?._uploadAvatar(),
-                    icon: const Icon(Icons.add_a_photo_outlined),
-                    label: const Text('上传头像'),
-                  ),
-              ],
-            ),
-            body: _busy
-                ? const Center(child: CircularProgressIndicator())
-                : _token == null
-                    ? Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(
-                                _error ?? 'Unable to connect.',
-                                textAlign: TextAlign.center,
-                              ),
-                              const SizedBox(height: 12),
-                              FilledButton(
-                                onPressed: () {
-                                  setState(() => _busy = true);
-                                  _connect();
-                                },
-                                child: const Text('重试连接'),
-                              ),
-                            ],
-                          ),
-                        ),
-                      )
-                    : DirectChatScreen(
-                        key: _chatScreenKey,
-                        api: widget.api,
-                        clientId: widget.clientId,
-                        token: _token!,
-                        cache: widget.cache,
-                      ),
+    navigatorKey: _navigatorKey,
+    title: 'Consent Chat',
+    theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
+    home: PopScope<Object?>(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) unawaited(_exitClient());
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          automaticallyImplyLeading: false,
+          leading: IconButton(
+            tooltip: '修改名称',
+            onPressed: () => unawaited(_editClientName()),
+            icon: const Icon(Icons.edit_outlined),
           ),
+          title: InkWell(
+            onTap: () => unawaited(_editClientName()),
+            child: Text(
+              _clientName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 16),
+            ),
+          ),
+          actions: [
+            if (_token != null)
+              TextButton.icon(
+                onPressed: () => _chatScreenKey.currentState?._uploadAvatar(),
+                icon: const Icon(Icons.add_a_photo_outlined),
+                label: const Text('上传头像'),
+              ),
+          ],
         ),
-      );
+        body: _busy
+            ? const Center(child: CircularProgressIndicator())
+            : _token == null
+            ? Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _error ?? 'Unable to connect.',
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 12),
+                      FilledButton(
+                        onPressed: () {
+                          setState(() => _busy = true);
+                          _connect();
+                        },
+                        child: const Text('重试连接'),
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            : DirectChatScreen(
+                key: _chatScreenKey,
+                api: widget.api,
+                clientId: widget.clientId,
+                token: _token!,
+                cache: widget.cache,
+              ),
+      ),
+    ),
+  );
 }
 
 class DirectChatScreen extends StatefulWidget {
@@ -1830,6 +2228,7 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
   final _text = TextEditingController();
   final _scrollController = ScrollController();
   Timer? _pollTimer;
+  Timer? _videoCallInviteTimer;
   Timer? _profileTimer;
   Timer? _mediaCleanupTimer;
   final _recorder = AudioRecorder();
@@ -1838,6 +2237,8 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
   bool _polling = false;
   bool _exitingForServerShutdown = false;
   bool _showingVibrationAlert = false;
+  bool _pollingVideoCallInvites = false;
+  final Set<String> _handledVideoCallIds = {};
   int _consecutiveServerFailures = 0;
   final Set<String> _sendingMessageIds = {};
   final Set<String> _cancelledMessageIds = {};
@@ -1863,10 +2264,11 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
     final expiredMessages = cachedMessages
         .where((message) => !isDirectClientMessageVisible(message, now: now))
         .toList();
-    _messages = cachedMessages
-        .where((message) => isDirectClientMessageVisible(message, now: now))
-        .toList()
-      ..sort(compareDirectMessages);
+    _messages =
+        cachedMessages
+            .where((message) => isDirectClientMessageVisible(message, now: now))
+            .toList()
+          ..sort(compareDirectMessages);
     if (expiredMessages.isNotEmpty) {
       unawaited(_persistMessages());
       unawaited(_purgeExpiredMessageAttachments(expiredMessages));
@@ -1884,6 +2286,10 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
     unawaited(_refreshProfile());
     _poll();
     _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) => _poll());
+    _videoCallInviteTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => unawaited(_pollVideoCallInvites()),
+    );
     _profileTimer = Timer.periodic(
       const Duration(seconds: 30),
       (_) => _refreshProfile(),
@@ -1893,12 +2299,118 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
   @override
   void dispose() {
     _pollTimer?.cancel();
+    _videoCallInviteTimer?.cancel();
     _profileTimer?.cancel();
     _mediaCleanupTimer?.cancel();
     _recorder.dispose();
     _text.dispose();
     _scrollController.dispose();
     super.dispose();
+  }
+
+  Future<void> _pollVideoCallInvites() async {
+    if (_pollingVideoCallInvites || !mounted) return;
+    _pollingVideoCallInvites = true;
+    try {
+      final events = await widget.api.pollVideoCallSignals(
+        clientId: widget.clientId,
+        token: widget.token,
+      );
+      for (final event in events) {
+        final callId = event['call_id'];
+        if (event['type'] != 'incoming' ||
+            callId is! String ||
+            !_handledVideoCallIds.add(callId)) {
+          continue;
+        }
+        await _showIncomingVideoCall(event);
+      }
+    } catch (error, stackTrace) {
+      AppLogger.log(
+        'video_call.invite_poll_failed',
+        level: 'warning',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    } finally {
+      _pollingVideoCallInvites = false;
+    }
+  }
+
+  Future<void> _showIncomingVideoCall(Map<String, dynamic> invite) async {
+    final callId = invite['call_id'];
+    if (callId is! String || !mounted) return;
+    final accepted = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('视频通话邀请'),
+        content: const Text('服务端正在呼叫。接听后摄像头和麦克风将保持开启。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('拒绝'),
+          ),
+          FilledButton.icon(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            icon: const Icon(Icons.videocam),
+            label: const Text('接听'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    try {
+      await widget.api.sendVideoCallSignal(
+        clientId: widget.clientId,
+        token: widget.token,
+        callId: callId,
+        type: accepted == true ? 'accept' : 'reject',
+      );
+      if (accepted != true || !mounted) return;
+      final rawIceServers = invite['ice_servers'];
+      final iceServers = rawIceServers is List
+          ? rawIceServers
+                .whereType<Map>()
+                .map(Map<String, dynamic>.from)
+                .toList()
+          : const <Map<String, dynamic>>[
+              {
+                'urls': ['stun:stun.l.google.com:19302'],
+              },
+            ];
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => DirectVideoCallDialog(
+          callId: callId,
+          clientSide: true,
+          iceServers: iceServers,
+          sendSignal: (type, {sdp, candidate}) =>
+              widget.api.sendVideoCallSignal(
+                clientId: widget.clientId,
+                token: widget.token,
+                callId: callId,
+                type: type,
+                sdp: sdp,
+                candidate: candidate,
+              ),
+          pollSignals: () => widget.api.pollVideoCallSignals(
+            clientId: widget.clientId,
+            token: widget.token,
+          ),
+          onClose: () => Navigator.of(dialogContext).pop(),
+        ),
+      );
+    } catch (error, stackTrace) {
+      AppLogger.log(
+        'video_call.invite_response_failed',
+        level: 'error',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (mounted) setState(() => _error = '视频通话信令失败：$error');
+    }
   }
 
   Future<void> _refreshProfile() async {
@@ -1971,7 +2483,8 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
     if (_polling || _deletingMessages) return;
     _polling = true;
     final revision = _messageRevision;
-    final wasNearEnd = !_scrollController.hasClients ||
+    final wasNearEnd =
+        !_scrollController.hasClients ||
         _scrollController.position.extentAfter < 80;
     try {
       final sent = <Map<String, dynamic>>[];
@@ -1983,13 +2496,11 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
             !_cancelledMessageIds.contains(message['id'].toString()),
       )) {
         try {
-          _updateMessageStatus(
-            pending['id'].toString(),
-            {
-              'delivery_state':
-                  pending['file_path'] is String ? 'uploading' : 'sending',
-            },
-          );
+          _updateMessageStatus(pending['id'].toString(), {
+            'delivery_state': pending['file_path'] is String
+                ? 'uploading'
+                : 'sending',
+          });
           final response = pending['file_path'] is String
               ? await widget.api.sendMediaFile(
                   clientId: widget.clientId,
@@ -2000,26 +2511,24 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
                   filePath: pending['file_path'] as String,
                   fileSize: pending['media_size'] as int,
                   encryptedChunks: pending['encrypted_local'] == true,
-                  rawVideoChunks: pending['encrypted_local'] != true &&
-                      (pending['mime_type'] as String? ?? '')
-                          .startsWith('video/'),
+                  rawVideoChunks:
+                      pending['encrypted_local'] != true &&
+                      (pending['mime_type'] as String? ?? '').startsWith(
+                        'video/',
+                      ),
                   sourceChunkCount: pending['chunk_count'] as int?,
                   body: pending['body']?.toString() ?? '',
                   previewData: pending['preview_data'] as String?,
                   onUploadState: (uploadId, _) async {
-                    _updateMessageStatus(
-                      pending['id'].toString(),
-                      {'upload_id': uploadId},
-                    );
+                    _updateMessageStatus(pending['id'].toString(), {
+                      'upload_id': uploadId,
+                    });
                     await _persistMessages();
                   },
-                  isCancelled: () => _cancelledMessageIds.contains(
-                    pending['id'].toString(),
-                  ),
-                  onProgress: (progress) => _updateUploadProgress(
-                    pending['id'].toString(),
-                    progress,
-                  ),
+                  isCancelled: () =>
+                      _cancelledMessageIds.contains(pending['id'].toString()),
+                  onProgress: (progress) =>
+                      _updateUploadProgress(pending['id'].toString(), progress),
                 )
               : await widget.api.send(
                   clientId: widget.clientId,
@@ -2039,22 +2548,17 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
           }
           sent.add(response);
         } on Exception {
-          _updateMessageStatus(
-            pending['id'].toString(),
-            {
-              'delivery_state': 'failed',
-              'upload_progress': 0,
-              'upload_error': '连接失败，请重试。',
-            },
-          );
+          _updateMessageStatus(pending['id'].toString(), {
+            'delivery_state': 'failed',
+            'upload_progress': 0,
+            'upload_error': '连接失败，请重试。',
+          });
         }
       }
       final received = (await widget.api.messages(
         clientId: widget.clientId,
         token: widget.token,
-      ))
-          .where(isDirectClientMessageVisible)
-          .toList();
+      )).where(isDirectClientMessageVisible).toList();
       if (_deletingMessages || revision != _messageRevision) return;
       final previousById = {
         for (final message in _messages) message['id'].toString(): message,
@@ -2068,9 +2572,7 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
       merged.removeWhere((message) => !isDirectClientMessageVisible(message));
       final newVibrationAlert = received.where((message) {
         return message['type'] == 'vibration_alert' &&
-            !_messages.any(
-              (existing) => existing['id'] == message['id'],
-            );
+            !_messages.any((existing) => existing['id'] == message['id']);
       }).firstOrNull;
       final messagesChanged = !directMessageListsEqual(_messages, merged);
       if (messagesChanged) await _persistMessages(merged);
@@ -2084,9 +2586,10 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
       }
 
       if (sent.isNotEmpty) {
-        AppLogger.log('client.queued_messages_sent', details: {
-          'count': sent.length,
-        });
+        AppLogger.log(
+          'client.queued_messages_sent',
+          details: {'count': sent.length},
+        );
       }
       if (newVibrationAlert != null) {
         unawaited(_showVibrationAlert());
@@ -2096,11 +2599,7 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
       );
       if (messagesChanged && hasNewMessages && wasNearEnd) _scrollToEnd();
     } catch (error) {
-      AppLogger.log(
-        'client.sync_failed',
-        level: 'error',
-        error: error,
-      );
+      AppLogger.log('client.sync_failed', level: 'error', error: error);
       if (error is SocketException || error is TimeoutException) {
         _consecutiveServerFailures++;
         if (_consecutiveServerFailures >= 3) {
@@ -2287,8 +2786,10 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
         }
         final sourcePath = message['source_file_path'];
         if (sourcePath is String &&
-            RegExp(r'(^|[\\/])voice-[A-Za-z0-9-]+\.m4a$', caseSensitive: false)
-                .hasMatch(sourcePath) &&
+            RegExp(
+              r'(^|[\\/])voice-[A-Za-z0-9-]+\.m4a$',
+              caseSensitive: false,
+            ).hasMatch(sourcePath) &&
             await _isManagedClientCachePath(sourcePath)) {
           try {
             await File(sourcePath).delete();
@@ -2342,9 +2843,7 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
       tempDirectory.path,
     ];
     for (final root in roots) {
-      final normalizedRoot = Directory(root)
-          .absolute
-          .path
+      final normalizedRoot = Directory(root).absolute.path
           .replaceAll(RegExp(r'[\\/]+$'), '')
           .toLowerCase();
       if (normalizedPath.startsWith(
@@ -2393,8 +2892,10 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
         }
         final sourcePath = message['source_file_path'];
         if (sourcePath is String &&
-            RegExp(r'(^|[\\/])voice-[A-Za-z0-9-]+\.m4a$', caseSensitive: false)
-                .hasMatch(sourcePath) &&
+            RegExp(
+              r'(^|[\\/])voice-[A-Za-z0-9-]+\.m4a$',
+              caseSensitive: false,
+            ).hasMatch(sourcePath) &&
             await _isManagedClientCachePath(sourcePath)) {
           await File(sourcePath).delete();
         }
@@ -2507,9 +3008,10 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
   void _send() {
     final body = _text.text.trim();
     if (body.isEmpty) return;
-    AppLogger.log('client.message_send_started', details: {
-      'characters': body.length,
-    });
+    AppLogger.log(
+      'client.message_send_started',
+      details: {'characters': body.length},
+    );
     final pendingMessage = <String, dynamic>{
       'id': _uuid.v4(),
       'client_id': widget.clientId,
@@ -2563,22 +3065,19 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
       ]..sort(compareDirectMessages);
       if (mounted) setState(() => _messages = merged);
       unawaited(
-          _persistMessages().catchError((Object error, StackTrace stackTrace) {
-        AppLogger.log(
-          'client.message_cache_write_failed',
-          level: 'error',
-          error: error,
-          stackTrace: stackTrace,
-        );
-      }));
+        _persistMessages().catchError((Object error, StackTrace stackTrace) {
+          AppLogger.log(
+            'client.message_cache_write_failed',
+            level: 'error',
+            error: error,
+            stackTrace: stackTrace,
+          );
+        }),
+      );
       AppLogger.log('client.message_sent');
       _scrollToEnd();
     } catch (error) {
-      AppLogger.log(
-        'client.message_send_failed',
-        level: 'error',
-        error: error,
-      );
+      AppLogger.log('client.message_send_failed', level: 'error', error: error);
       if (mounted) {
         _updateMessageStatus(messageId, {
           'delivery_state': 'failed',
@@ -2658,10 +3157,7 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
           (!mimeType.startsWith('image/') && !mimeType.startsWith('video/'))) {
         return null;
       }
-      return createDirectMediaPreview(
-        filePath: file.path!,
-        mimeType: mimeType,
-      );
+      return createDirectMediaPreview(filePath: file.path!, mimeType: mimeType);
     }).toList();
     setState(() {
       _messages = [..._messages, ...selectedMessages]
@@ -2678,10 +3174,10 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
         _sendingMessageIds.remove(selectedMessages[index]['id']);
         continue;
       }
-      _updateMessageStatus(
-        selectedMessages[index]['id'] as String,
-        {'delivery_state': 'preparing', 'prepare_progress': 0},
-      );
+      _updateMessageStatus(selectedMessages[index]['id'] as String, {
+        'delivery_state': 'preparing',
+        'prepare_progress': 0,
+      });
       try {
         await _sendAttachment(
           files[index].name,
@@ -2694,13 +3190,10 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
         );
       } catch (error, stackTrace) {
         _sendingMessageIds.remove(selectedMessages[index]['id']);
-        _updateMessageStatus(
-          selectedMessages[index]['id'] as String,
-          {
-            'delivery_state': 'failed',
-            'upload_error': error.toString(),
-          },
-        );
+        _updateMessageStatus(selectedMessages[index]['id'] as String, {
+          'delivery_state': 'failed',
+          'upload_error': error.toString(),
+        });
         AppLogger.log(
           'client.attachment_send_failed',
           level: 'error',
@@ -2752,8 +3245,11 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
       if (mounted) setState(() => _recording = true);
     } catch (error) {
       if (mounted) setState(() => _error = '无法开始录音：$error');
-      AppLogger.log('client.recording_start_failed',
-          level: 'error', error: error);
+      AppLogger.log(
+        'client.recording_start_failed',
+        level: 'error',
+        error: error,
+      );
     }
   }
 
@@ -2766,7 +3262,8 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
     Map<String, dynamic>? existingPendingMessage,
     Future<String?>? previewFuture,
   }) async {
-    final pendingMessage = existingPendingMessage ??
+    final pendingMessage =
+        existingPendingMessage ??
         <String, dynamic>{
           'id': _uuid.v4(),
           'client_id': widget.clientId,
@@ -2800,32 +3297,33 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
     String? localPath;
     String? localDirectoryPath;
     var localChunkCount = 0;
-    final previewResult = previewFuture ??
+    final previewResult =
+        previewFuture ??
         (sourcePath != null &&
                 (mimeType.startsWith('image/') || mimeType.startsWith('video/'))
-            ? createDirectMediaPreview(
-                filePath: sourcePath,
-                mimeType: mimeType,
-              )
+            ? createDirectMediaPreview(filePath: sourcePath, mimeType: mimeType)
             : null);
     if (previewResult != null) {
-      unawaited(previewResult.then((previewData) {
-        if (previewData == null || _cancelledMessageIds.contains(messageId)) {
-          return Future<void>.value();
-        }
-        pendingMessage['preview_data'] = previewData;
-        _updateMessageStatus(messageId, {'preview_data': previewData});
-        return _persistMessages().catchError(
-          (Object error, StackTrace stackTrace) {
+      unawaited(
+        previewResult.then((previewData) {
+          if (previewData == null || _cancelledMessageIds.contains(messageId)) {
+            return Future<void>.value();
+          }
+          pendingMessage['preview_data'] = previewData;
+          _updateMessageStatus(messageId, {'preview_data': previewData});
+          return _persistMessages().catchError((
+            Object error,
+            StackTrace stackTrace,
+          ) {
             AppLogger.log(
               'client.message_cache_write_failed',
               level: 'error',
               error: error,
               stackTrace: stackTrace,
             );
-          },
-        );
-      }));
+          });
+        }),
+      );
     }
     try {
       if (fileSize <= 0) throw const FileSystemException('所选文件为空。');
@@ -2834,7 +3332,8 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
         segments: [widget.clientId, messageId],
       );
       localDirectoryPath = pendingDirectory.path;
-      final stream = sourceStream ??
+      final stream =
+          sourceStream ??
           (sourcePath == null ? null : File(sourcePath).openRead());
       if (stream == null) {
         throw const FileSystemException('无法读取所选文件。');
@@ -2842,8 +3341,10 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
       const chunkSize = 1024 * 1024;
       var copied = 0;
       void updatePreparationProgress(int copiedBytes) {
-        final preparationProgress =
-            (copiedBytes * 100 ~/ fileSize).clamp(0, 100);
+        final preparationProgress = (copiedBytes * 100 ~/ fileSize).clamp(
+          0,
+          100,
+        );
         final previousPreparationProgress =
             pendingMessage['prepare_progress'] as int? ?? -1;
         if (preparationProgress == 100 ||
@@ -3035,10 +3536,10 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
         if (mounted) setState(() => _messages = merged);
         unawaited(_persistMessages());
         unawaited(_scheduleMediaCleanup());
-        AppLogger.log('client.attachment_sent', details: {
-          'bytes': fileSize,
-          'mime_type': mimeType,
-        });
+        AppLogger.log(
+          'client.attachment_sent',
+          details: {'bytes': fileSize, 'mime_type': mimeType},
+        );
         _scrollToEnd();
       } catch (error) {
         if (_cancelledMessageIds.contains(messageId)) {
@@ -3072,24 +3573,26 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
         _cancelledMessageIds.remove(messageId);
       }
     });
-    _attachmentQueue = queuedUpload.catchError(
-      (Object error, StackTrace stackTrace) {
-        AppLogger.log(
-          'client.attachment_queue_failed',
-          level: 'error',
-          details: {'message_id': messageId},
-          error: error,
-          stackTrace: stackTrace,
-        );
-      },
-    );
+    _attachmentQueue = queuedUpload.catchError((
+      Object error,
+      StackTrace stackTrace,
+    ) {
+      AppLogger.log(
+        'client.attachment_queue_failed',
+        level: 'error',
+        details: {'message_id': messageId},
+        error: error,
+        stackTrace: stackTrace,
+      );
+    });
     await _persistMessages();
     await queuedUpload;
   }
 
   void _updateUploadProgress(String messageId, int progress) {
-    final message =
-        _messages.where((item) => item['id'] == messageId).firstOrNull;
+    final message = _messages
+        .where((item) => item['id'] == messageId)
+        .firstOrNull;
     final previous = message?['upload_progress'] as int? ?? -1;
     if (message == null ||
         previous == progress ||
@@ -3109,8 +3612,9 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
   }
 
   void _retryMessage(String messageId) {
-    final message =
-        _messages.where((item) => item['id'] == messageId).firstOrNull;
+    final message = _messages
+        .where((item) => item['id'] == messageId)
+        .firstOrNull;
     if (message == null) return;
     message.remove('upload_error');
     _updateMessageStatus(messageId, {
@@ -3140,29 +3644,18 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
     return 'direct-local:${widget.clientId}:$messageId';
   }
 
-  Future<void> _openAttachment(Map<String, dynamic> message) async {
+  Future<String> _prepareAttachment(Map<String, dynamic> message) async {
     final messageId = message['id'].toString();
-    try {
-      final outgoingVideoPath = directOutgoingVideoPath(message);
-      if (outgoingVideoPath != null && await File(outgoingVideoPath).exists()) {
-        final error = await openDirectAttachment({
-          ...message,
-          'media_path': outgoingVideoPath,
-        });
-        if (error != null && mounted) setState(() => _error = error);
-        return;
-      }
-    } catch (error, stackTrace) {
-      AppLogger.log(
-        'client.local_video_open_failed',
-        level: 'error',
-        error: error,
-        stackTrace: stackTrace,
-      );
-      if (mounted) setState(() => _error = '无法播放本机视频：$error');
-      return;
+    final existingPath =
+        message['media_path'] ??
+        message['source_file_path'] ??
+        message['file_path'];
+    if (existingPath is String && await File(existingPath).exists()) {
+      return existingPath;
     }
-    if (!_downloadingMessageIds.add(messageId)) return;
+    if (!_downloadingMessageIds.add(messageId)) {
+      throw StateError('附件正在下载。');
+    }
     setState(() {
       _downloadProgress[messageId] = 0;
       _error = null;
@@ -3177,11 +3670,8 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
           'client-downloads',
           segments: [widget.clientId, 'local', messageId],
         );
-        final safeName =
-            (message['file_name'] as String? ?? 'attachment').replaceAll(
-          RegExp(r'[^A-Za-z0-9._-]'),
-          '_',
-        );
+        final safeName = (message['file_name'] as String? ?? 'attachment')
+            .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
         final path = '${directory.path}${Platform.pathSeparator}$safeName';
         await DirectAttachmentDownloads.instance.download(
           key: 'direct-local:${widget.clientId}:$messageId',
@@ -3193,13 +3683,13 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
           },
           download: (onProgress, isCancelled) =>
               widget.api.decryptLocalMediaToFile(
-            encryptedDirectory: localSource,
-            chunkCount: message['chunk_count'] as int,
-            expectedSize: message['media_size'] as int,
-            outputPath: path,
-            isCancelled: isCancelled,
-            onProgress: onProgress,
-          ),
+                encryptedDirectory: localSource,
+                chunkCount: message['chunk_count'] as int,
+                expectedSize: message['media_size'] as int,
+                outputPath: path,
+                isCancelled: isCancelled,
+                onProgress: onProgress,
+              ),
         );
         message['media_path'] = path;
         await _persistMessages();
@@ -3213,17 +3703,15 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
           'client-downloads',
           segments: [widget.clientId, message['media_id'] as String],
         );
-        final safeName =
-            (message['file_name'] as String? ?? 'attachment').replaceAll(
-          RegExp(r'[^A-Za-z0-9._-]'),
-          '_',
-        );
+        final safeName = (message['file_name'] as String? ?? 'attachment')
+            .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
         final path = '${directory.path}${Platform.pathSeparator}$safeName';
         await DirectAttachmentDownloads.instance.download(
           key: 'direct:${widget.clientId}:${message['media_id']}',
           expectedSize: message['media_size'] as int? ?? 0,
-          sequential:
-              (message['mime_type'] as String? ?? '').startsWith('video/'),
+          sequential: (message['mime_type'] as String? ?? '').startsWith(
+            'video/',
+          ),
           onProgress: (progress) {
             if (mounted) {
               setState(() => _downloadProgress[messageId] = progress);
@@ -3244,16 +3732,56 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
         await _persistMessages();
         if (mounted) setState(() {});
       }
-      final error = await openDirectAttachment(message);
-      if (error != null && mounted) setState(() => _error = error);
-    } on DirectDownloadCancelled {
-      // Keep completed chunks so the next attempt can resume.
-    } catch (error) {
-      if (mounted) setState(() => _error = '无法打开附件：$error');
+      final localPath =
+          message['media_path'] ??
+          message['source_file_path'] ??
+          message['file_path'];
+      if (localPath is String && await File(localPath).exists()) {
+        return localPath;
+      }
+      final encoded = message['media_data'];
+      if (encoded is String) {
+        final directory = await directCacheDirectory(
+          'opened-attachments',
+          segments: [message['media_id']?.toString() ?? messageId],
+        );
+        final safeName = (message['file_name'] as String? ?? 'attachment')
+            .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+        final path = '${directory.path}${Platform.pathSeparator}$safeName';
+        await File(path).writeAsBytes(base64Decode(encoded), flush: true);
+        message['media_path'] = path;
+        return path;
+      }
+      throw StateError('附件文件尚未下载。');
     } finally {
       _downloadingMessageIds.remove(messageId);
       _downloadProgress.remove(messageId);
       if (mounted) setState(() {});
+    }
+  }
+
+  Future<void> _openAttachment(Map<String, dynamic> message) async {
+    try {
+      final outgoingVideoPath = directOutgoingVideoPath(message);
+      final path =
+          outgoingVideoPath != null && await File(outgoingVideoPath).exists()
+          ? outgoingVideoPath
+          : await _prepareAttachment(message);
+      final error = await openDirectAttachment({
+        ...message,
+        'media_path': path,
+      }, context: context);
+      if (error != null && mounted) setState(() => _error = error);
+    } on DirectDownloadCancelled {
+      // Keep completed chunks so the next attempt can resume.
+    } catch (error, stackTrace) {
+      AppLogger.log(
+        'client.attachment_open_failed',
+        level: 'error',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (mounted) setState(() => _error = '无法打开附件：$error');
     }
   }
 
@@ -3271,8 +3799,9 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final visibleMessages =
-        _messages.where(isDirectMessageVisible).toList(growable: false);
+    final visibleMessages = _messages
+        .where(isDirectMessageVisible)
+        .toList(growable: false);
     return Column(
       children: [
         if (_error != null)
@@ -3288,68 +3817,72 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
                   padding: const EdgeInsets.all(12),
                   children: [
                     for (final message in visibleMessages)
-                      Builder(builder: (context) {
-                        final messageId = message['id'].toString();
-                        final mediaId = message['media_id'];
-                        final downloadKey = mediaId is String ||
-                                message['encrypted_local'] == true
-                            ? _downloadKey(message)
-                            : null;
-                        Widget buildBubble(int? activeProgress) =>
-                            DirectMessageBubble(
-                              key: ValueKey(messageId),
-                              message: message,
-                              outgoing: message['sender'] == 'client',
-                              avatarData: message['sender'] == 'client'
-                                  ? _myAvatar
-                                  : _otherAvatar,
-                              onOpenAttachment: () => _openAttachment(message),
-                              onRetry: message['delivery_state'] == 'failed'
-                                  ? () => _retryMessage(messageId)
-                                  : null,
-                              downloading:
-                                  _downloadingMessageIds.contains(messageId) ||
-                                      activeProgress != null,
-                              onCancelDownload: () =>
-                                  _cancelDownload(messageId),
-                              downloadProgress: _downloadProgress[messageId] ??
-                                  activeProgress,
-                              showTimestamp: false,
-                            );
-                        Widget selectableBubble(Widget bubble) {
-                          if (!_selectionMode) return bubble;
-                          return Row(
-                            children: [
-                              Checkbox(
-                                value: _selectedMessageIds.contains(messageId),
-                                onChanged: _deletingMessages
-                                    ? null
-                                    : (selected) => setState(() {
+                      Builder(
+                        builder: (context) {
+                          final messageId = message['id'].toString();
+                          final mediaId = message['media_id'];
+                          final downloadKey =
+                              mediaId is String ||
+                                  message['encrypted_local'] == true
+                              ? _downloadKey(message)
+                              : null;
+                          Widget buildBubble(
+                            int? activeProgress,
+                          ) => DirectMessageBubble(
+                            key: ValueKey(messageId),
+                            message: message,
+                            outgoing: message['sender'] == 'client',
+                            avatarData: message['sender'] == 'client'
+                                ? _myAvatar
+                                : _otherAvatar,
+                            onOpenAttachment: () => _openAttachment(message),
+                            onRetry: message['delivery_state'] == 'failed'
+                                ? () => _retryMessage(messageId)
+                                : null,
+                            downloading:
+                                _downloadingMessageIds.contains(messageId) ||
+                                activeProgress != null,
+                            onCancelDownload: () => _cancelDownload(messageId),
+                            downloadProgress:
+                                _downloadProgress[messageId] ?? activeProgress,
+                            showTimestamp: false,
+                          );
+                          Widget selectableBubble(Widget bubble) {
+                            if (!_selectionMode) return bubble;
+                            return Row(
+                              children: [
+                                Checkbox(
+                                  value: _selectedMessageIds.contains(
+                                    messageId,
+                                  ),
+                                  onChanged: _deletingMessages
+                                      ? null
+                                      : (selected) => setState(() {
                                           if (selected == true) {
                                             _selectedMessageIds.add(messageId);
                                           } else {
-                                            _selectedMessageIds
-                                                .remove(messageId);
+                                            _selectedMessageIds.remove(
+                                              messageId,
+                                            );
                                           }
                                         }),
-                              ),
-                              Expanded(child: bubble),
-                            ],
-                          );
-                        }
+                                ),
+                                Expanded(child: bubble),
+                              ],
+                            );
+                          }
 
-                        if (downloadKey == null) {
-                          return selectableBubble(buildBubble(null));
-                        }
-                        return ValueListenableBuilder<int?>(
-                          valueListenable: DirectAttachmentDownloads.instance
-                              .progressListenable(downloadKey),
-                          builder: (context, activeProgress, _) =>
-                              selectableBubble(
-                            buildBubble(activeProgress),
-                          ),
-                        );
-                      }),
+                          if (downloadKey == null) {
+                            return selectableBubble(buildBubble(null));
+                          }
+                          return ValueListenableBuilder<int?>(
+                            valueListenable: DirectAttachmentDownloads.instance
+                                .progressListenable(downloadKey),
+                            builder: (context, activeProgress, _) =>
+                                selectableBubble(buildBubble(activeProgress)),
+                          );
+                        },
+                      ),
                   ],
                 ),
         ),
@@ -3362,19 +3895,19 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
                   onPressed: _deletingMessages
                       ? null
                       : () => setState(() {
-                            if (_selectedMessageIds.length ==
-                                visibleMessages.length) {
-                              _selectedMessageIds.clear();
-                            } else {
-                              _selectedMessageIds
-                                ..clear()
-                                ..addAll(
-                                  visibleMessages.map(
-                                    (message) => message['id'].toString(),
-                                  ),
-                                );
-                            }
-                          }),
+                          if (_selectedMessageIds.length ==
+                              visibleMessages.length) {
+                            _selectedMessageIds.clear();
+                          } else {
+                            _selectedMessageIds
+                              ..clear()
+                              ..addAll(
+                                visibleMessages.map(
+                                  (message) => message['id'].toString(),
+                                ),
+                              );
+                          }
+                        }),
                   child: Text(
                     _selectedMessageIds.length == visibleMessages.length
                         ? '取消全选'
@@ -3387,9 +3920,9 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
                   onPressed: _deletingMessages
                       ? null
                       : () => setState(() {
-                            _selectionMode = false;
-                            _selectedMessageIds.clear();
-                          }),
+                          _selectionMode = false;
+                          _selectedMessageIds.clear();
+                        }),
                   child: const Text('取消'),
                 ),
                 FilledButton.icon(
@@ -3458,24 +3991,30 @@ class _DirectChatScreenState extends State<DirectChatScreen> {
                     IconButton(
                       tooltip: '发送图片或视频',
                       onPressed: () => _pickAttachment(FileType.media),
-                      constraints:
-                          const BoxConstraints.tightFor(width: 52, height: 52),
+                      constraints: const BoxConstraints.tightFor(
+                        width: 52,
+                        height: 52,
+                      ),
                       padding: EdgeInsets.zero,
                       icon: const Icon(Icons.image),
                     ),
                     IconButton(
                       tooltip: '发送文件',
                       onPressed: () => _pickAttachment(FileType.any),
-                      constraints:
-                          const BoxConstraints.tightFor(width: 52, height: 52),
+                      constraints: const BoxConstraints.tightFor(
+                        width: 52,
+                        height: 52,
+                      ),
                       padding: EdgeInsets.zero,
                       icon: const Icon(Icons.attach_file),
                     ),
                     IconButton(
                       tooltip: _recording ? '停止并发送语音' : '录制语音',
                       onPressed: _toggleRecording,
-                      constraints:
-                          const BoxConstraints.tightFor(width: 52, height: 52),
+                      constraints: const BoxConstraints.tightFor(
+                        width: 52,
+                        height: 52,
+                      ),
                       padding: EdgeInsets.zero,
                       icon: Icon(_recording ? Icons.stop_circle : Icons.mic),
                     ),
@@ -3517,25 +4056,27 @@ class DirectMessageBubble extends StatelessWidget {
   final VoidCallback onOpenAttachment;
 
   Widget _previewPlaceholder(bool isVideo) => ColoredBox(
-        color: Colors.black12,
-        child: Center(
-          child: Icon(
-            isVideo ? Icons.video_file_outlined : Icons.image_outlined,
-            size: 48,
-            color: Colors.black45,
-          ),
-        ),
-      );
+    color: Colors.black12,
+    child: Center(
+      child: Icon(
+        isVideo ? Icons.video_file_outlined : Icons.image_outlined,
+        size: 48,
+        color: Colors.black45,
+      ),
+    ),
+  );
 
   Widget _mediaPreview(BuildContext context, String mimeType) {
     final isVideo = mimeType.startsWith('video/');
     final previewData = message['preview_data'];
-    final mediaPath = directOutgoingVideoPath(message) ??
+    final mediaPath =
+        directOutgoingVideoPath(message) ??
         message['media_path'] as String? ??
         (message['encrypted_local'] == true
             ? null
             : message['file_path'] as String?);
-    final locallyAvailable = mediaPath != null ||
+    final locallyAvailable =
+        mediaPath != null ||
         message['encrypted_local'] == true ||
         message['media_data'] is String ||
         previewData is String;
@@ -3601,8 +4142,11 @@ class DirectMessageBubble extends StatelessWidget {
                   ),
                   child: Padding(
                     padding: EdgeInsets.all(12),
-                    child:
-                        Icon(Icons.play_arrow, color: Colors.white, size: 32),
+                    child: Icon(
+                      Icons.play_arrow,
+                      color: Colors.white,
+                      size: 32,
+                    ),
                   ),
                 ),
               ),
@@ -3684,12 +4228,31 @@ class DirectMessageBubble extends StatelessWidget {
     );
   }
 
+  Widget _audioPlaybackButton(String messageId) =>
+      ValueListenableBuilder<String?>(
+        valueListenable: directAudioPlayback.activeMessageId,
+        builder: (context, activeMessageId, _) => ValueListenableBuilder<bool>(
+          valueListenable: directAudioPlayback.isPlaying,
+          builder: (context, isPlaying, _) {
+            final playing = activeMessageId == messageId && isPlaying;
+            return IconButton(
+              tooltip: playing ? '暂停语音' : '播放语音',
+              onPressed: downloading ? null : onOpenAttachment,
+              icon: Icon(
+                playing ? Icons.pause_circle_filled : Icons.play_circle_fill,
+              ),
+            );
+          },
+        ),
+      );
+
   @override
   Widget build(BuildContext context) {
     final mimeType = message['mime_type'] as String? ?? '';
     final isVisualMedia =
         mimeType.startsWith('image/') || mimeType.startsWith('video/');
-    final hasAttachment = message['file_path'] is String ||
+    final hasAttachment =
+        message['file_path'] is String ||
         message['media_id'] != null ||
         message['media_data'] is String ||
         message['file_name'] is String;
@@ -3699,7 +4262,7 @@ class DirectMessageBubble extends StatelessWidget {
     final timestamp = createdAt == null
         ? null
         : '${createdAt.year}-${createdAt.month.toString().padLeft(2, '0')}-${createdAt.day.toString().padLeft(2, '0')} '
-            '${createdAt.hour.toString().padLeft(2, '0')}:${createdAt.minute.toString().padLeft(2, '0')}';
+              '${createdAt.hour.toString().padLeft(2, '0')}:${createdAt.minute.toString().padLeft(2, '0')}';
     return Align(
       alignment: Alignment.center,
       child: Column(
@@ -3719,8 +4282,9 @@ class DirectMessageBubble extends StatelessWidget {
             child: Row(
               mainAxisSize: MainAxisSize.max,
               crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisAlignment:
-                  outgoing ? MainAxisAlignment.end : MainAxisAlignment.start,
+              mainAxisAlignment: outgoing
+                  ? MainAxisAlignment.end
+                  : MainAxisAlignment.start,
               children: [
                 if (!outgoing) ...[
                   _MessageAvatar(
@@ -3733,8 +4297,10 @@ class DirectMessageBubble extends StatelessWidget {
                 ],
                 Flexible(
                   child: Card(
-                    margin:
-                        const EdgeInsets.symmetric(vertical: 2, horizontal: 2),
+                    margin: const EdgeInsets.symmetric(
+                      vertical: 2,
+                      horizontal: 2,
+                    ),
                     color: outgoing
                         ? Theme.of(context).colorScheme.primaryContainer
                         : Theme.of(context).colorScheme.secondaryContainer,
@@ -3769,11 +4335,17 @@ class DirectMessageBubble extends StatelessWidget {
                                         ? Icons.audio_file
                                         : Icons.insert_drive_file,
                                   ),
+                                  if (mimeType.startsWith('audio/')) ...[
+                                    _audioPlaybackButton(
+                                      message['id'].toString(),
+                                    ),
+                                  ],
                                   const SizedBox(width: 8),
                                   Flexible(
                                     child: InkWell(
-                                      onTap:
-                                          downloading ? null : onOpenAttachment,
+                                      onTap: downloading
+                                          ? null
+                                          : onOpenAttachment,
                                       child: Column(
                                         crossAxisAlignment:
                                             CrossAxisAlignment.start,
@@ -3783,8 +4355,9 @@ class DirectMessageBubble extends StatelessWidget {
                                                 '附件',
                                             overflow: TextOverflow.ellipsis,
                                             maxLines: 2,
-                                            style:
-                                                const TextStyle(fontSize: 12),
+                                            style: const TextStyle(
+                                              fontSize: 12,
+                                            ),
                                           ),
                                           Text(
                                             formatDirectFileSize(
@@ -3872,10 +4445,7 @@ class DirectMessageBubble extends StatelessWidget {
 }
 
 class _AttachmentUploadProgress extends StatelessWidget {
-  const _AttachmentUploadProgress({
-    required this.progress,
-    this.label = '上传中',
-  });
+  const _AttachmentUploadProgress({required this.progress, this.label = '上传中'});
 
   final int progress;
   final String label;
@@ -3888,10 +4458,7 @@ class _AttachmentUploadProgress extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            '$label $value%',
-            style: Theme.of(context).textTheme.labelSmall,
-          ),
+          Text('$label $value%', style: Theme.of(context).textTheme.labelSmall),
           const SizedBox(height: 3),
           LinearProgressIndicator(value: value / 100),
         ],
@@ -3908,21 +4475,21 @@ class _MessageAvatar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => InkWell(
-        onTap: onTap,
-        customBorder: const CircleBorder(),
-        child: CircleAvatar(
-          radius: 17,
-          backgroundImage: data == null ? null : _directMemoryImage(data!),
-          child: data == null
-              ? Image.asset(
-                  'assets/app_icon.png',
-                  width: 26,
-                  height: 26,
-                  fit: BoxFit.cover,
-                )
-              : null,
-        ),
-      );
+    onTap: onTap,
+    customBorder: const CircleBorder(),
+    child: CircleAvatar(
+      radius: 17,
+      backgroundImage: data == null ? null : _directMemoryImage(data!),
+      child: data == null
+          ? Image.asset(
+              'assets/app_icon.png',
+              width: 26,
+              height: 26,
+              fit: BoxFit.cover,
+            )
+          : null,
+    ),
+  );
 }
 
 class _MessageDeliveryStatus extends StatelessWidget {
@@ -3942,7 +4509,17 @@ class _MessageDeliveryStatus extends StatelessWidget {
       return Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.close, size: 16, color: Colors.red),
+          if (onCancel != null)
+            IconButton(
+              tooltip: '删除待发送附件',
+              onPressed: onCancel,
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints.tightFor(width: 28, height: 28),
+              icon: const Icon(Icons.close, size: 16, color: Colors.red),
+            )
+          else
+            const Icon(Icons.close, size: 16, color: Colors.red),
           if (onRetry != null)
             TextButton.icon(
               onPressed: onRetry,

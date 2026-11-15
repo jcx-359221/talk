@@ -1,0 +1,123 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Install Visual Studio C++ Build Tools",
+			"type": "shell",
+			"command": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\vs_BuildTools.exe",
+			"args": [
+				"--quiet",
+				"--wait",
+				"--norestart",
+				"--installPath",
+				"C:\\BuildTools\\VS2022",
+				"--add",
+				"Microsoft.VisualStudio.Workload.VCTools",
+				"--includeRecommended"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Build all release files to dist",
+			"type": "shell",
+			"command": "powershell.exe",
+			"args": [
+				"-NoProfile",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"${workspaceFolder}\\scripts\\build-release.ps1"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Inspect Visual Studio install logs",
+			"type": "shell",
+			"command": "powershell.exe",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"Get-ChildItem \"$env:TEMP\\dd_*.log\" | Sort-Object LastWriteTime -Descending | Select-Object -First 10 FullName,Length,LastWriteTime; Get-ChildItem \"$env:TEMP\\dd_*.log\" | Sort-Object LastWriteTime -Descending | Select-Object -First 3 | ForEach-Object { Write-Output \"--- $($_.Name) ---\"; Select-String -Path $_.FullName -Pattern 'error|failed|cancel|exit|completed|download|package' | Select-Object -Last 12 }"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "List Visual Studio logs",
+			"type": "shell",
+			"command": "powershell.exe",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"Get-ChildItem $env:TEMP -Filter dd_*.log | Sort-Object LastWriteTime -Descending | Select-Object -First 10 Name,FullName,Length,LastWriteTime"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Find Visual Studio install errors",
+			"type": "shell",
+			"command": "powershell.exe",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"Get-ChildItem $env:TEMP -Filter dd_setup_*.log | Sort-Object LastWriteTime -Descending | Select-Object -First 30 | Select-String -Pattern error,failed,exception,rollback | Select-Object -First 30"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Verify MSVC compiler",
+			"type": "shell",
+			"command": "powershell.exe",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$cl='C:\\BuildTools\\VS2022\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe'; Write-Output \"cl_exists=$(Test-Path $cl)\"; & 'C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe' -all -products '*' -property installationPath; Get-Process | Where-Object {$_.ProcessName -match 'vs_installer|setup|vs_BuildTools|vs_setup_bootstrapper'} | Select-Object ProcessName,Id,CPU"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Check Flutter Windows toolchain",
+			"type": "shell",
+			"command": "D:\\BuildTools\\flutter\\bin\\flutter.bat",
+			"args": [
+				"doctor",
+				"-v"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Complete Visual Studio Desktop C++ workload",
+			"type": "shell",
+			"command": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\vs_BuildTools.exe",
+			"args": [
+				"--quiet",
+				"--wait",
+				"--norestart",
+				"--installPath",
+				"C:\\BuildTools\\VS2022",
+				"--add",
+				"Microsoft.VisualStudio.Workload.NativeDesktop",
+				"--includeRecommended"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Verify complete Visual Studio workload",
+			"type": "shell",
+			"command": "D:\\BuildTools\\flutter\\bin\\flutter.bat",
+			"args": [
+				"doctor",
+				"-v"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}

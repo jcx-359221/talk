@@ -47,8 +47,29 @@ Future<void> main() async {
   var startupBlockReason = clientBlacklisted
       ? '此设备已被拉黑，应用已锁定。'
       : await clientStartupBlockReason(cache);
+  try {
+    await cache.putText('direct-invite-code', '');
+  } catch (error, stackTrace) {
+    AppLogger.log(
+      'client.invite_code_cache_clear_failed',
+      level: 'error',
+      error: error,
+      stackTrace: stackTrace,
+    );
+  }
   if (startupBlockReason == null) {
-    await initializeClientBackgroundService();
+    try {
+      await initializeClientBackgroundService();
+      await stopClientBackgroundService();
+    } catch (error, stackTrace) {
+      AppLogger.log(
+        'client.startup_service_stop_failed',
+        level: 'error',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      startupBlockReason = '无法停止上次后台连接，请关闭应用后重试。';
+    }
   } else {
     if (clientBlacklisted) {
       try {

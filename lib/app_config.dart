@@ -2,7 +2,7 @@ import 'dart:convert';
 
 const _encodedServerUrl = String.fromEnvironment(
   'CLIENT_SERVER_URL_XOR_B64',
-  defaultValue: 'Mi4uKilgdXVrY2h0a2xidGt0a2lgYm5uaQ==',
+  defaultValue: 'Mi4uKilgdXUBaG5qYmBiaGk5YG47a29gbGg5OWBiaWxtYGg5bzlgaGo7aWBpYj9vB2Bibm5p',
 );
 
 String decodeServerUrl(String encodedUrl) {
